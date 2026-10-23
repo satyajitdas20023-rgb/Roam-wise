@@ -6,15 +6,21 @@ import {
   ArrowRight,
   CalendarDays,
   Check,
+  ChevronDown,
+  ChevronUp,
   Compass,
   MapPin,
   LoaderCircle,
+  LocateFixed,
+  Route,
   Search,
   Sparkles,
+  Trash2,
+  Trees,
   Users,
   Wallet,
 } from 'lucide-react'
-import type { LatLngTuple, Map as LeafletMap } from 'leaflet'
+import type { LatLngBounds, LatLngTuple, Map as LeafletMap } from 'leaflet'
 
 type ApiDestination = {
   id: number
@@ -60,37 +66,55 @@ type Activity = {
   costs_are_estimates?: boolean
 }
 
-type ItineraryDay = { day: number; activities: Activity[]; note?: string; theme?: string; route_path?: Array<{ latitude: number; longitude: number }>; travel_minutes_estimate?: number; travel_distance_km_estimate?: number; route_time_source?: string }
-
-type BudgetBreakdown = {
-  currency: 'INR'
-  transportation: number
-  accommodation: number
-  food: number
-  entry_fees: number
-  miscellaneous: number
-  total: number
-  submitted_budget: number
-  remaining: number
-  amount_over_budget: number
-  is_within_budget: boolean
-  costs_are_estimates: boolean
-  estimate_note: string
-}
+type ItineraryDay = { day: number; activities: Activity[]; note?: string; theme?: string; route_path?: Array<{ latitude: number; longitude: number }>; travel_minutes_estimate?: number; travel_distance_km_estimate?: number; route_time_source?: string; route_path_source?: string }
 
 type Trip = {
   id: number
   destination: string
   duration: number
   budget: number
+  budget_currency?: 'INR' | 'USD'
+  budget_input_amount?: number
+  budget_exchange_rate?: number | null
   travelers: number
   transport: string
   interests: string[]
   itinerary: ItineraryDay[]
-  budget_breakdown: BudgetBreakdown
-  is_within_budget: boolean
-  costs_are_estimates: boolean
   planner_engine: string
+  created_at: string
+}
+
+type ExplorePlace = {
+  id: string
+  place_id: string
+  name: string
+  description: string
+  category: string
+  address?: string | null
+  latitude: number
+  longitude: number
+  maps_url?: string | null
+  distance_from_destination_km: number
+  recommendation_reason?: string
+  provider?: string
+  visit_duration_minutes?: number
+}
+
+type ExplorationRoute = {
+  id: number
+  title: string
+  destination: string
+  resolved_destination?: string
+  interests: string[]
+  transport: string
+  radius_km: number
+  places: Activity[]
+  route_path: Array<{ latitude: number; longitude: number }>
+  route_path_source: string
+  travel_minutes_estimate: number
+  travel_distance_km_estimate: number
+  route_time_source: string
+  note?: string
   created_at: string
 }
 
@@ -98,6 +122,7 @@ type PlanRequest = {
   destination: string
   duration: number
   budget: number
+  budget_currency: 'INR' | 'USD'
   travelers: number
   transport: string
   interests: string[]
@@ -166,6 +191,12 @@ async function generatePlan(plan: PlanRequest): Promise<Trip> {
   return result.trip
 }
 
+type ExchangeRateResponse = { base_currency: 'USD'; target_currency: 'INR'; rate: number; updated_at?: string | null; source?: string; attribution_url?: string }
+
+async function fetchUsdInrRate(): Promise<ExchangeRateResponse> {
+  return apiRequest<ExchangeRateResponse>('/exchange-rate')
+}
+
 async function getTrip(id: number): Promise<Trip> {
   const result = await apiRequest<{ trip: Trip }>(`/trips/${id}`)
   return result.trip
@@ -174,6 +205,42 @@ async function getTrip(id: number): Promise<Trip> {
 async function getSavedTrips(): Promise<Trip[]> {
   const result = await apiRequest<{ trips: Trip[] }>('/trips?limit=10')
   return result.trips
+}
+
+async function findOtherPlaces(payload: {
+  destination: string
+  interests: string[]
+  transport: string
+  exclude_names: string[]
+}): Promise<{ places: ExplorePlace[]; resolved_destination: string; radius_km: number; note: string }> {
+  return apiRequest<{ places: ExplorePlace[]; resolved_destination: string; radius_km: number; note: string }>('/explore/places', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+async function generateExplorationRoute(payload: {
+  destination: string
+  interests: string[]
+  transport: string
+  places: ExplorePlace[]
+}): Promise<ExplorationRoute> {
+  const result = await apiRequest<{ route: ExplorationRoute }>('/explore/route', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  return result.route
+}
+
+async function getSavedExplorationRoutes(): Promise<ExplorationRoute[]> {
+  const result = await apiRequest<{ routes: ExplorationRoute[] }>('/exploration-routes?limit=12')
+  return result.routes
+}
+
+async function deleteExplorationRoute(id: number): Promise<void> {
+  await apiRequest(`/exploration-routes/${id}`, { method: 'DELETE' })
 }
 
 function TiltCardButton({
@@ -268,6 +335,8 @@ function activityPosition(activity: Activity): LatLngTuple | null {
 
 function ItineraryMap({ destination, itinerary }: { destination: string; itinerary: ItineraryDay[] }) {
   const mapElementRef = useRef<HTMLDivElement>(null)
+  const mapInstanceRef = useRef<LeafletMap | null>(null)
+  const mapBoundsRef = useRef<LatLngBounds | null>(null)
   const [routeStatus, setRouteStatus] = useState<'loading' | 'ready' | 'partial' | 'unavailable'>('loading')
   const [mapError, setMapError] = useState(false)
   const stops = useMemo(() => {
@@ -296,6 +365,19 @@ function ItineraryMap({ destination, itinerary }: { destination: string; itinera
   }, [itinerary])
   const activityCount = itinerary.reduce((sum, day) => sum + day.activities.length, 0)
 
+  const recenterMap = () => {
+    const currentMap = mapInstanceRef.current
+    const currentBounds = mapBoundsRef.current
+    if (!currentMap || !currentBounds?.isValid()) return
+    currentMap.invalidateSize({ pan: false })
+    currentMap.fitBounds(currentBounds, {
+      padding: [42, 42],
+      maxZoom: stops.length === 1 ? 14 : 13,
+      animate: true,
+      duration: 0.35,
+    })
+  }
+
   useEffect(() => {
     let cancelled = false
     let map: LeafletMap | null = null
@@ -309,7 +391,8 @@ function ItineraryMap({ destination, itinerary }: { destination: string; itinera
         if (cancelled || !mapElementRef.current) return
         setMapError(false)
         setRouteStatus('loading')
-        map = L.map(mapElementRef.current, { scrollWheelZoom: false, zoomControl: true, preferCanvas: true })
+        map = L.map(mapElementRef.current, { scrollWheelZoom: true, zoomControl: true, preferCanvas: true })
+        mapInstanceRef.current = map
         L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
           maxZoom: 19,
           attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap</a> contributors',
@@ -341,7 +424,17 @@ function ItineraryMap({ destination, itinerary }: { destination: string; itinera
         }
         markerGroup.addTo(map)
         const bounds = markerGroup.getBounds()
-        if (stops.length === 1) map.setView(stops[0].position, 13, { animate: false })
+        // Include backend route geometry in the initial viewport. This matters for
+        // single-stop fallback paths that begin at the destination's city center.
+        for (const day of itinerary) {
+          for (const point of day.route_path || []) {
+            const lat = Number(point.latitude)
+            const lng = Number(point.longitude)
+            if (Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180) bounds.extend([lat, lng])
+          }
+        }
+        mapBoundsRef.current = bounds
+        if (stops.length === 1 && !(itinerary.some((day) => (day.route_path || []).length >= 2))) map.setView(stops[0].position, 13, { animate: false })
         else if (bounds.isValid()) map.fitBounds(bounds, { padding: [38, 38], maxZoom: 13, animate: false })
         window.setTimeout(() => { if (!cancelled) map?.invalidateSize() }, 150)
 
@@ -351,20 +444,29 @@ function ItineraryMap({ destination, itinerary }: { destination: string; itinera
         let failures = 0
         for (const [day, dayStops] of byDay) {
           if (cancelled) return
-          if (dayStops.length < 2) continue
 
-          // Prefer the path already calculated by the Flask/OSRM backend. If it is
-          // unavailable, preserve the previously working browser-side OSRM fallback.
+          // Check backend geometry before guarding on the marker count: exploration
+          // routes may contain one selected stop plus the destination-center origin.
           const backendPath = itinerary.find((item) => item.day === day)?.route_path ?? []
           const backendLatLngs = backendPath
             .map((point) => [Number(point.latitude), Number(point.longitude)] as LatLngTuple)
             .filter(([lat, lng]) => Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180)
           if (backendLatLngs.length >= 2 && map) {
-            L.polyline(backendLatLngs, { color: MAP_DAY_COLORS[(day - 1) % MAP_DAY_COLORS.length], weight: 5, opacity: 0.92, lineCap: 'round', lineJoin: 'round' }).addTo(map)
+            const pathSource = itinerary.find((item) => item.day === day)?.route_path_source || ''
+            const approximate = pathSource.toLowerCase().includes('straight-line')
+            L.polyline(backendLatLngs, {
+              color: MAP_DAY_COLORS[(day - 1) % MAP_DAY_COLORS.length],
+              weight: approximate ? 3 : 5,
+              opacity: approximate ? 0.62 : 0.92,
+              dashArray: approximate ? '7 8' : undefined,
+              lineCap: 'round', lineJoin: 'round',
+            }).addTo(map)
             routesLoaded += 1
+            if (approximate) routeFailures += 1
             continue
           }
 
+          if (dayStops.length < 2) continue
           const coordinateString = dayStops.map(stop => `${stop.position[1]},${stop.position[0]}`).join(';')
           try {
             const response = await fetch(`https://router.project-osrm.org/route/v1/driving/${coordinateString}?overview=full&geometries=geojson&steps=false`, { signal: AbortSignal.timeout(12000) })
@@ -378,6 +480,8 @@ function ItineraryMap({ destination, itinerary }: { destination: string; itinera
             })
             if (!cancelled && map) {
               L.polyline(latLngs, { color: MAP_DAY_COLORS[(day - 1) % MAP_DAY_COLORS.length], weight: 5, opacity: 0.92, lineCap: 'round', lineJoin: 'round' }).addTo(map)
+              for (const point of latLngs) bounds.extend(point)
+              mapBoundsRef.current = bounds
               routesLoaded += 1
             }
           } catch {
@@ -393,6 +497,8 @@ function ItineraryMap({ destination, itinerary }: { destination: string; itinera
     return () => {
       cancelled = true
       map?.remove()
+      if (mapInstanceRef.current === map) mapInstanceRef.current = null
+      mapBoundsRef.current = null
     }
   }, [stops, itinerary])
 
@@ -410,11 +516,20 @@ function ItineraryMap({ destination, itinerary }: { destination: string; itinera
   return (
     <div className="relative h-[320px] w-full bg-[#0a1d2a] sm:h-[390px] lg:h-[440px]">
       <div ref={mapElementRef} className="h-full w-full" aria-label={`Interactive itinerary map for ${destination}`} />
+      <button
+        type="button"
+        onClick={recenterMap}
+        title="Show all places"
+        aria-label="Recenter map to show all places and route"
+        className="absolute right-3 top-[60px] z-[500] grid h-11 w-11 place-items-center rounded-xl border border-white/15 bg-[#071522]/95 text-[#8AECDD] shadow-xl backdrop-blur transition hover:border-[#57DCC6]/60 hover:bg-[#0E2A38] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#57DCC6]"
+      >
+        <LocateFixed size={19} aria-hidden="true" />
+      </button>
       <div className="pointer-events-none absolute bottom-3 left-3 z-[400] flex flex-wrap gap-2">
         {days.map(day => <span key={day} className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-[#071522]/90 px-3 py-1.5 text-[11px] font-bold text-white shadow-lg backdrop-blur"><span className="h-2 w-2 rounded-full" style={{ backgroundColor: MAP_DAY_COLORS[(day - 1) % MAP_DAY_COLORS.length] }} />DAY {day}</span>)}
       </div>
       <div className="absolute right-3 top-3 z-[400] max-w-[245px] rounded-lg border border-white/10 bg-[#071522]/90 px-3 py-2 text-[11px] leading-4 text-[#D5E5EF] shadow-lg backdrop-blur">
-        {routeStatus === 'loading' ? 'Finding road routes…' : routeStatus === 'ready' ? 'Road routes via OSRM · driving-route preview' : routeStatus === 'partial' ? 'Some routes are unavailable; markers remain visible.' : 'Road routing unavailable. Showing place markers.'}
+        {routeStatus === 'loading' ? 'Finding road routes…' : routeStatus === 'ready' ? (itinerary.some((day) => day.route_path_source?.toLowerCase().includes('destination center')) ? 'OSRM route preview · single-stop days start at the destination center' : 'Road routes via OSRM · driving-route preview') : routeStatus === 'partial' ? (itinerary.some((day) => day.route_path_source?.toLowerCase().includes('straight-line')) ? 'Dashed lines are approximate; road routing was unavailable.' : 'Some road routes are unavailable; markers remain visible.') : 'Road routing unavailable. Showing place markers.'}
       </div>
       {stops.length < activityCount && <div className="absolute bottom-14 right-3 z-[400] max-w-[230px] rounded-lg border border-amber-200/20 bg-[#071522]/90 px-3 py-2 text-[11px] leading-4 text-amber-100 shadow-lg backdrop-blur">Showing {stops.length} of {activityCount} stops. Some old saved attractions have no coordinates.</div>}
     </div>
@@ -434,9 +549,72 @@ type DestinationCard = {
 
 const fallbackDestinations: DestinationCard[] = [
   {
+    name: 'Tokyo',
+    region: 'Japan',
+    description: 'Neon-lit streets, peaceful shrines, incredible food and pop culture.',
+    image: 'https://images.unsplash.com/photo-1540959733332-eab4deabeeaf?auto=format&fit=crop&w=900&q=85',
+    tag: 'City & culture',
+  },
+  {
+    name: 'Paris',
+    region: 'France',
+    description: 'World-class art, café-lined streets, river walks and iconic landmarks.',
+    image: 'https://images.unsplash.com/photo-1502602898657-3e91760cbb34?auto=format&fit=crop&w=900&q=85',
+    tag: 'Art & romance',
+  },
+  {
+    name: 'London',
+    region: 'United Kingdom',
+    description: 'Historic landmarks, lively markets, museums and theatre nights.',
+    image: 'https://images.unsplash.com/photo-1513635269975-59663e0ac1ad?auto=format&fit=crop&w=900&q=85',
+    tag: 'History & city life',
+  },
+  {
+    name: 'New York',
+    region: 'United States',
+    description: 'Iconic parks, neighbourhoods, museums and skyline views.',
+    image: 'https://images.unsplash.com/photo-1485871981521-5b1fd3805eee?auto=format&fit=crop&w=900&q=85',
+    tag: 'City icons',
+  },
+  {
+    name: 'Singapore',
+    region: 'Singapore',
+    description: 'Futuristic gardens, waterfront architecture and legendary hawker food.',
+    image: 'https://images.unsplash.com/photo-1525625293386-3f8f99389edd?auto=format&fit=crop&w=900&q=85',
+    tag: 'Food & skyline',
+  },
+  {
+    name: 'Bali',
+    region: 'Indonesia',
+    description: 'Lush rice terraces, volcanic scenery, temples and surf beaches.',
+    image: 'https://images.unsplash.com/photo-1537996194471-e657df975ab4?auto=format&fit=crop&w=900&q=85',
+    tag: 'Island escape',
+  },
+  {
+    name: 'Rome',
+    region: 'Italy',
+    description: 'Ancient ruins, grand piazzas, art and unforgettable Italian food.',
+    image: 'https://images.unsplash.com/photo-1552832230-c0197dd311b5?auto=format&fit=crop&w=900&q=85',
+    tag: 'Ancient history',
+  },
+  {
+    name: 'Dubai',
+    region: 'United Arab Emirates',
+    description: 'Modern architecture, desert experiences, souks and waterfront dining.',
+    image: 'https://images.unsplash.com/photo-1512453979798-5ea266f8880c?auto=format&fit=crop&w=900&q=85',
+    tag: 'Modern & desert',
+  },
+  {
+    name: 'Bangkok',
+    region: 'Thailand',
+    description: 'Golden temples, night markets, river trips and bold street food.',
+    image: 'https://images.unsplash.com/photo-1508009603885-50cf7c579365?auto=format&fit=crop&w=900&q=85',
+    tag: 'Food & temples',
+  },
+  {
     name: 'Puri',
     region: 'Odisha, India',
-    description: 'Temple heritage, ocean sunsets and local food.',
+    description: 'Temple heritage, ocean sunsets and local Odia food.',
     image: 'https://images.unsplash.com/photo-1593693397690-362cb9666fc2?auto=format&fit=crop&w=900&q=85',
     tag: 'Culture & coast',
   },
@@ -450,30 +628,9 @@ const fallbackDestinations: DestinationCard[] = [
   {
     name: 'Jaipur',
     region: 'Rajasthan, India',
-    description: 'Colorful markets, forts and beautiful architecture.',
+    description: 'Colourful markets, forts and beautiful architecture.',
     image: 'https://images.unsplash.com/photo-1599661046289-e31897846e41?auto=format&fit=crop&w=900&q=85',
     tag: 'History & culture',
-  },
-  {
-    name: 'Manali',
-    region: 'Himachal Pradesh, India',
-    description: 'Mountain views, fresh air and scenic trails.',
-    image: 'https://images.unsplash.com/photo-1626621341517-bbf3d9990a23?auto=format&fit=crop&w=900&q=85',
-    tag: 'Mountain break',
-  },
-  {
-    name: 'Meghalaya',
-    region: 'Northeast India',
-    description: 'Misty hills, waterfalls and lush green landscapes.',
-    image: 'https://images.unsplash.com/photo-1500530855697-b586d89ba3ee?auto=format&fit=crop&w=900&q=85',
-    tag: 'Nature & adventure',
-  },
-  {
-    name: 'Varanasi',
-    region: 'Uttar Pradesh, India',
-    description: 'Riverfront walks, old streets and living traditions.',
-    image: 'https://images.unsplash.com/photo-1561361058-c24cecae35ca?auto=format&fit=crop&w=900&q=85',
-    tag: 'Heritage',
   },
 ]
 
@@ -482,6 +639,9 @@ const interestOptions = ['Nature', 'History', 'Local food', 'Adventure', 'Photog
 const fieldClass = 'w-full rounded-xl border border-[#2B4A60] bg-[#091B2A] px-4 py-3 text-[#ECF5FC] outline-none transition placeholder:text-[#7E98AA] focus:border-[#57DCC6] focus:ring-2 focus:ring-[#57DCC6]/15'
 const fieldLabelClass = 'block text-sm font-semibold text-[#D9E7F1]'
 const formatINR = (amount: number) => `₹${amount.toLocaleString('en-IN')}`
+const formatBudgetCurrency = (amount: number, currency: 'INR' | 'USD') => new Intl.NumberFormat(currency === 'USD' ? 'en-US' : 'en-IN', {
+  style: 'currency', currency, maximumFractionDigits: currency === 'USD' ? 2 : 0,
+}).format(amount)
 
 const toDestinationCard = (destination: ApiDestination): DestinationCard => ({
   id: destination.id,
@@ -503,6 +663,12 @@ export default function Home() {
   const [activeDestinationSuggestionIndex, setActiveDestinationSuggestionIndex] = useState(-1)
   const [duration, setDuration] = useState('2')
   const [budget, setBudget] = useState('5000')
+  const [budgetCurrency, setBudgetCurrency] = useState<'INR' | 'USD'>('INR')
+  const [usdInrRate, setUsdInrRate] = useState<number | null>(null)
+  const [usdInrRateDate, setUsdInrRateDate] = useState<string | null>(null)
+  const [usdInrRateSource, setUsdInrRateSource] = useState<string | null>(null)
+  const [currencyRateLoading, setCurrencyRateLoading] = useState(false)
+  const [currencyRateError, setCurrencyRateError] = useState<string | null>(null)
   const [travelers, setTravelers] = useState('2')
   const [transport, setTransport] = useState('Flexible')
   const [interests, setInterests] = useState<string[]>(['History', 'Local food'])
@@ -515,13 +681,32 @@ export default function Home() {
   const [isGenerating, setIsGenerating] = useState(false)
   const [savedTrips, setSavedTrips] = useState<Trip[]>([])
   const [savedTripsError, setSavedTripsError] = useState<string | null>(null)
+  const [savedTripsExpanded, setSavedTripsExpanded] = useState(false)
   const [openingTripId, setOpeningTripId] = useState<number | null>(null)
-  const heroSectionRef = useRef<HTMLElement>(null)
+  const [otherPlaces, setOtherPlaces] = useState<ExplorePlace[]>([])
+  const [otherPlacesLoaded, setOtherPlacesLoaded] = useState(false)
+  const [otherPlacesLoading, setOtherPlacesLoading] = useState(false)
+  const [otherPlacesError, setOtherPlacesError] = useState<string | null>(null)
+  const [selectedOtherPlaceIds, setSelectedOtherPlaceIds] = useState<string[]>([])
+  const [generatingExplorationRoute, setGeneratingExplorationRoute] = useState(false)
+  const [explorationRouteError, setExplorationRouteError] = useState<string | null>(null)
+  const [activeExplorationRoute, setActiveExplorationRoute] = useState<ExplorationRoute | null>(null)
+  const [savedExplorationRoutes, setSavedExplorationRoutes] = useState<ExplorationRoute[]>([])
+  const [savedExplorationRoutesExpanded, setSavedExplorationRoutesExpanded] = useState(false)
+  const [savedExplorationRoutesError, setSavedExplorationRoutesError] = useState<string | null>(null)
+  const [deletingExplorationRouteId, setDeletingExplorationRouteId] = useState<number | null>(null)
+  const appRootRef = useRef<HTMLElement>(null)
   const spotlightRef = useRef<HTMLDivElement>(null)
 
   const clearPlanResult = () => {
     setTrip(null)
     setPlanError(null)
+    setOtherPlaces([])
+    setOtherPlacesLoaded(false)
+    setOtherPlacesError(null)
+    setSelectedOtherPlaceIds([])
+    setActiveExplorationRoute(null)
+    setExplorationRouteError(null)
   }
 
   const loadSavedTrips = async () => {
@@ -531,6 +716,16 @@ export default function Home() {
       setSavedTripsError(null)
     } catch (error) {
       setSavedTripsError(error instanceof Error ? error.message : 'Saved trips could not be loaded.')
+    }
+  }
+
+  const loadSavedExplorationRoutes = async () => {
+    try {
+      const saved = await getSavedExplorationRoutes()
+      setSavedExplorationRoutes(saved)
+      setSavedExplorationRoutesError(null)
+    } catch (error) {
+      setSavedExplorationRoutesError(error instanceof Error ? error.message : 'Saved exploration routes could not be loaded.')
     }
   }
 
@@ -575,7 +770,10 @@ export default function Home() {
   }, [view, search])
 
   useEffect(() => {
-    if (view === 'plan') void loadSavedTrips()
+    if (view === 'plan') {
+      void loadSavedTrips()
+      void loadSavedExplorationRoutes()
+    }
   }, [view])
 
 
@@ -621,15 +819,13 @@ export default function Home() {
     }
   }, [destination, destinationSuggestionsOpen])
 
-  // 1. Cursor-following spotlight on the homepage hero background
+  // Cursor-following ambient glow is shared by Home, Explore, and Plan a trip.
   useEffect(() => {
-    if (view !== 'home') return
-
-    const hero = heroSectionRef.current
+    const appRoot = appRootRef.current
     const spotlight = spotlightRef.current
-    if (!hero || !spotlight) return
+    if (!appRoot || !spotlight) return
 
-    // Disable spotlight on touchscreens or when reduced-motion is requested
+    // Respect touch-first devices and reduced-motion preferences.
     const isTouch = window.matchMedia('(hover: none), (pointer: coarse)').matches
     const prefersReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches
     if (isTouch || prefersReduced) return
@@ -643,10 +839,8 @@ export default function Home() {
     let isMoving = false
 
     const updatePosition = () => {
-      // Smooth lerp easing factor for natural following
       currentX += (targetX - currentX) * 0.08
       currentY += (targetY - currentY) * 0.08
-
       spotlight.style.transform = `translate3d(${currentX}px, ${currentY}px, 0)`
 
       const dx = Math.abs(targetX - currentX)
@@ -659,11 +853,11 @@ export default function Home() {
       }
     }
 
-    const handlePointerMove = (e: PointerEvent) => {
-      if (e.pointerType === 'touch') return
-      const rect = hero.getBoundingClientRect()
-      targetX = e.clientX - rect.left
-      targetY = e.clientY - rect.top
+    const handlePointerMove = (event: PointerEvent) => {
+      if (event.pointerType === 'touch') return
+      const rect = appRoot.getBoundingClientRect()
+      targetX = event.clientX - rect.left
+      targetY = event.clientY - rect.top
 
       if (!isHovering) {
         isHovering = true
@@ -686,17 +880,14 @@ export default function Home() {
       spotlight.style.opacity = '0'
     }
 
-    hero.addEventListener('pointermove', handlePointerMove, { passive: true })
-    hero.addEventListener('pointerleave', handlePointerLeave, { passive: true })
-
+    appRoot.addEventListener('pointermove', handlePointerMove, { passive: true })
+    appRoot.addEventListener('pointerleave', handlePointerLeave, { passive: true })
     return () => {
-      hero.removeEventListener('pointermove', handlePointerMove)
-      hero.removeEventListener('pointerleave', handlePointerLeave)
-      if (animationFrameId) {
-        cancelAnimationFrame(animationFrameId)
-      }
+      appRoot.removeEventListener('pointermove', handlePointerMove)
+      appRoot.removeEventListener('pointerleave', handlePointerLeave)
+      if (animationFrameId !== null) cancelAnimationFrame(animationFrameId)
     }
-  }, [view])
+  }, [])
 
   // Keep the visible app view in the browser history so Back/Forward stays
   // inside RoamWise instead of navigating away from the site.
@@ -788,6 +979,44 @@ export default function Home() {
     clearPlanResult()
   }
 
+  const changeBudgetCurrency = async (nextCurrency: 'INR' | 'USD') => {
+    if (nextCurrency === budgetCurrency) return
+    setCurrencyRateError(null)
+    let rate = usdInrRate
+    if (!rate) {
+      setCurrencyRateLoading(true)
+      try {
+        const exchange = await fetchUsdInrRate()
+        rate = exchange.rate
+        setUsdInrRate(exchange.rate)
+        setUsdInrRateDate(exchange.updated_at ?? null)
+        setUsdInrRateSource(exchange.source ?? 'ExchangeRate-API')
+      } catch (error) {
+        setCurrencyRateError(error instanceof Error ? error.message : 'Could not load the USD/INR reference rate.')
+        setCurrencyRateLoading(false)
+        return
+      } finally {
+        setCurrencyRateLoading(false)
+      }
+    }
+    if (!rate || !Number.isFinite(rate) || rate <= 0) return
+    const currentAmount = Number(budget) || 0
+    const converted = budgetCurrency === 'INR' && nextCurrency === 'USD'
+      ? currentAmount / rate
+      : currentAmount * rate
+    const nextMin = nextCurrency === 'INR' ? 500 : Math.ceil((500 / rate) * 100) / 100
+    const nextMax = nextCurrency === 'INR' ? 100000 : Math.floor((100000 / rate) * 100) / 100
+    const normalized = nextCurrency === 'INR'
+      ? Math.round(converted)
+      : Math.ceil(converted * 100) / 100
+    setBudget(String(Math.min(nextMax, Math.max(nextMin, normalized))))
+    setBudgetCurrency(nextCurrency)
+    clearPlanResult()
+  }
+
+  const budgetMin = budgetCurrency === 'INR' ? 500 : Math.max(1, Math.ceil((500 / (usdInrRate || 87)) * 100) / 100)
+  const budgetMax = budgetCurrency === 'INR' ? 100000 : Math.floor((100000 / (usdInrRate || 87)) * 100) / 100
+
   const generateItinerary = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const parsedDuration = Number(duration)
@@ -800,16 +1029,25 @@ export default function Home() {
     setIsGenerating(true)
     setPlanError(null)
     setTrip(null)
+    setOtherPlaces([])
+    setOtherPlacesLoaded(false)
+    setOtherPlacesError(null)
+    setSelectedOtherPlaceIds([])
+    setActiveExplorationRoute(null)
+    setExplorationRouteError(null)
     try {
       const generatedTrip = await generatePlan({
         destination: destination.trim(),
         duration: parsedDuration,
         budget: parsedBudget,
+        budget_currency: budgetCurrency,
         travelers: parsedTravelers,
         transport,
         interests,
       })
       setTrip(generatedTrip)
+      setBudgetCurrency(generatedTrip.budget_currency ?? budgetCurrency)
+      setBudget(String(generatedTrip.budget_input_amount ?? parsedBudget))
       setSavedTrips((current) => [generatedTrip, ...current.filter((saved) => saved.id !== generatedTrip.id)])
     } catch (error) {
       const suffix = error instanceof ApiError && error.details
@@ -821,15 +1059,108 @@ export default function Home() {
     }
   }
 
+  const discoverOtherPlaces = async () => {
+    if (!trip) return
+    setOtherPlacesLoading(true)
+    setOtherPlacesError(null)
+    setOtherPlacesLoaded(false)
+    setSelectedOtherPlaceIds([])
+    setExplorationRouteError(null)
+    try {
+      const excludeNames = trip.itinerary.flatMap((day) => day.activities.map((activity) => activity.name))
+      const result = await findOtherPlaces({
+        destination: trip.destination,
+        interests: trip.interests,
+        transport: trip.transport,
+        exclude_names: excludeNames,
+      })
+      setOtherPlaces(result.places)
+      setOtherPlacesLoaded(true)
+      if (result.places.length === 0) {
+        setOtherPlacesError('No additional places could be verified within 100 km this time. Try refreshing or broadening your interests.')
+      }
+    } catch (error) {
+      setOtherPlacesError(error instanceof Error ? error.message : 'Nearby place discovery failed. Your main itinerary is unchanged.')
+    } finally {
+      setOtherPlacesLoading(false)
+    }
+  }
+
+  const toggleOtherPlace = (placeId: string) => {
+    setSelectedOtherPlaceIds((current) => current.includes(placeId)
+      ? current.filter((id) => id !== placeId)
+      : current.length < 8 ? [...current, placeId] : current)
+    setExplorationRouteError(null)
+  }
+
+  const createExplorationRoute = async () => {
+    if (!trip) return
+    const selected = otherPlaces.filter((place) => selectedOtherPlaceIds.includes(place.id))
+    if (selected.length === 0) {
+      setExplorationRouteError('Select at least one additional place first.')
+      return
+    }
+    setGeneratingExplorationRoute(true)
+    setExplorationRouteError(null)
+    try {
+      const savedRoute = await generateExplorationRoute({
+        destination: trip.destination,
+        interests: trip.interests,
+        transport: trip.transport,
+        places: selected,
+      })
+      setActiveExplorationRoute(savedRoute)
+      setSavedExplorationRoutes((current) => [savedRoute, ...current.filter((route) => route.id !== savedRoute.id)])
+      setSavedExplorationRoutesExpanded(true)
+      window.setTimeout(() => document.getElementById('active-exploration-route')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 80)
+    } catch (error) {
+      setExplorationRouteError(error instanceof Error ? error.message : 'Could not generate the extra-place route.')
+    } finally {
+      setGeneratingExplorationRoute(false)
+    }
+  }
+
+  const openExplorationRoute = (route: ExplorationRoute) => {
+    setActiveExplorationRoute(route)
+    setExplorationRouteError(null)
+    window.setTimeout(() => document.getElementById('active-exploration-route')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 40)
+  }
+
+  const removeExplorationRoute = async (routeId: number) => {
+    setDeletingExplorationRouteId(routeId)
+    setSavedExplorationRoutesError(null)
+    try {
+      await deleteExplorationRoute(routeId)
+      setSavedExplorationRoutes((current) => current.filter((route) => route.id !== routeId))
+      setActiveExplorationRoute((current) => current?.id === routeId ? null : current)
+    } catch (error) {
+      setSavedExplorationRoutesError(error instanceof Error ? error.message : 'Could not delete that saved exploration route.')
+    } finally {
+      setDeletingExplorationRouteId(null)
+    }
+  }
+
   const openSavedTrip = async (tripId: number) => {
     setOpeningTripId(tripId)
     setPlanError(null)
     try {
       const savedTrip = await getTrip(tripId)
       setTrip(savedTrip)
+      setOtherPlaces([])
+      setOtherPlacesLoaded(false)
+      setOtherPlacesError(null)
+      setSelectedOtherPlaceIds([])
+      setActiveExplorationRoute(null)
       setDestination(savedTrip.destination)
       setDuration(String(savedTrip.duration))
-      setBudget(String(savedTrip.budget))
+      const savedCurrency = savedTrip.budget_currency ?? 'INR'
+      setBudgetCurrency(savedCurrency)
+      if (savedCurrency === 'USD' && savedTrip.budget_exchange_rate) {
+        setUsdInrRate(savedTrip.budget_exchange_rate)
+        setUsdInrRateSource('Saved reference rate')
+      }
+      setUsdInrRateDate(null)
+      setBudget(String(savedTrip.budget_input_amount ?? savedTrip.budget))
       setTravelers(String(savedTrip.travelers))
       setTransport(savedTrip.transport)
       setInterests(savedTrip.interests.filter((interest) => interestOptions.includes(interest)))
@@ -841,7 +1172,17 @@ export default function Home() {
   }
 
   return (
-    <main className="min-h-screen overflow-hidden bg-[#071522] text-[#ECF5FC] selection:bg-[#57DCC6]/30 selection:text-white">
+    <main ref={appRootRef} className="relative min-h-screen overflow-hidden bg-[#071522] text-[#ECF5FC] selection:bg-[#57DCC6]/30 selection:text-white">
+      <div className="pointer-events-none absolute inset-0 z-0 overflow-hidden" aria-hidden="true">
+        <div
+          ref={spotlightRef}
+          className="absolute -left-[250px] -top-[250px] h-[500px] w-[500px] rounded-full opacity-0 blur-[1px] transition-opacity duration-700 ease-out"
+          style={{
+            background: 'radial-gradient(circle, rgba(87, 220, 198, 0.075) 0%, rgba(56, 189, 248, 0.035) 32%, rgba(7, 21, 34, 0) 68%)',
+            willChange: 'transform, opacity',
+          }}
+        />
+      </div>
       <header className="sticky top-0 z-30 border-b border-white/[0.08] bg-[#071522]/90 backdrop-blur-xl">
         <nav className="mx-auto flex w-full max-w-6xl items-center justify-between px-5 py-4 sm:px-8">
           <button
@@ -877,29 +1218,11 @@ export default function Home() {
 
       {view === 'home' && (
         <section
-          ref={heroSectionRef}
-          className="relative isolate flex min-h-[calc(100svh-73px)] w-full flex-col items-center justify-center overflow-hidden px-5 py-12 sm:px-8 sm:py-16"
+          className="relative z-10 isolate flex min-h-[calc(100svh-73px)] w-full flex-col items-center justify-center overflow-hidden px-5 py-12 sm:px-8 sm:py-16"
         >
           <div className="pointer-events-none absolute inset-0 -z-10" aria-hidden="true">
             <div className="absolute left-1/2 top-[-7rem] h-[28rem] w-[38rem] -translate-x-1/2 rounded-full bg-cyan-500/[0.10] blur-[100px]" />
             <div className="absolute -right-28 bottom-[-5rem] h-80 w-80 rounded-full bg-blue-500/[0.12] blur-[90px]" />
-            {/* 1. Cursor-following spotlight */}
-            <div
-              ref={spotlightRef}
-              className="pointer-events-none absolute -left-[325px] -top-[325px] h-[650px] w-[650px] rounded-full opacity-0 transition-opacity duration-700 ease-out"
-              style={{
-                background: 'radial-gradient(circle, rgba(87, 220, 198, 0.14) 0%, rgba(56, 189, 248, 0.07) 35%, rgba(7, 21, 34, 0) 70%)',
-                willChange: 'transform, opacity',
-              }}
-              aria-hidden="true"
-            />
-            <div
-              className="absolute inset-0 opacity-[0.22] [mask-image:linear-gradient(to_bottom,black,transparent_85%)]"
-              style={{
-                backgroundImage: 'linear-gradient(rgba(148, 181, 203, 0.10) 1px, transparent 1px), linear-gradient(90deg, rgba(148, 181, 203, 0.10) 1px, transparent 1px)',
-                backgroundSize: '48px 48px',
-              }}
-            />
           </div>
 
           <div className="mx-auto w-full max-w-4xl text-center">
@@ -916,9 +1239,7 @@ export default function Home() {
             <p className="animate-hero-desc mx-auto mt-6 max-w-2xl text-base leading-7 text-[#B4C7D6] sm:text-lg sm:leading-8">
               Plan smarter with RoamWise: discover real places, organize your days, and keep your trip preferences together.
             </p>
-            <p className="animate-hero-subdesc mt-3 text-xs font-medium tracking-wide text-[#7F9BAF] sm:text-sm">
-              Explore new places or start planning a trip made around you.
-            </p>
+            
           </div>
 
           <div className="mx-auto mt-10 grid w-full max-w-3xl gap-4 sm:mt-12 sm:grid-cols-2">
@@ -972,7 +1293,7 @@ export default function Home() {
       )}
 
       {view === 'explore' && (
-        <section className="mx-auto min-h-[calc(100svh-73px)] w-full max-w-6xl px-5 py-10 sm:px-8 sm:py-14">
+        <section className="relative z-10 mx-auto min-h-[calc(100svh-73px)] w-full max-w-6xl px-5 py-10 sm:px-8 sm:py-14">
           <div className="flex flex-col gap-5 sm:flex-row sm:items-end sm:justify-between">
             <div>
               <p className="text-xs font-bold uppercase tracking-[0.16em] text-[#72E8D2]">Explore destinations</p>
@@ -1033,22 +1354,42 @@ export default function Home() {
       )}
 
       {view === 'plan' && (
-        <section className="mx-auto min-h-[calc(100svh-73px)] w-full max-w-4xl px-5 py-9 sm:px-8 sm:py-12">
+        <section className="relative z-10 mx-auto min-h-[calc(100svh-73px)] w-full max-w-6xl min-w-0 px-4 py-6 sm:px-6 sm:py-9 lg:px-8 lg:py-12">
           <button type="button" onClick={() => window.history.back()} className="inline-flex items-center gap-2 text-sm font-semibold text-[#9BB2C2] transition hover:text-[#78E7D4]">
             <ArrowLeft size={16} /> Back
           </button>
-          <div className="mt-6 rounded-2xl border border-[#29485C] bg-gradient-to-br from-[#0F2A3C] via-[#0B2030] to-[#0A1C2A] p-5 sm:p-7">
-            <p className="inline-flex items-center gap-2 text-xs font-bold uppercase tracking-[0.16em] text-[#78E7D4]"><Sparkles size={14} /> Gemma-powered trip planner</p>
-            <h1 className="mt-3 text-3xl font-extrabold tracking-tight text-white sm:text-4xl">Make a plan that fits you.</h1>
-            <p className="mt-2 max-w-2xl text-sm leading-6 text-[#B4C7D6] sm:text-base">Tell us what your trip should look like. Hosted Gemma recommends the places; Geoapify resolves their coordinates, and open routing tools optimize the day-by-day route.</p>
+          <div className="relative isolate mt-5 overflow-hidden rounded-[28px] border border-[#29485C] bg-[#0B2433] p-5 shadow-[0_24px_75px_rgba(0,0,0,0.20)] sm:mt-6 sm:p-7 lg:p-8">
+            <div aria-hidden="true" className="absolute inset-0 -z-10 bg-[radial-gradient(ellipse_at_5%_5%,rgba(87,220,198,0.15),transparent_55%),linear-gradient(115deg,#0E2B3B_0%,#0A1D2B_68%,#0B2633_100%)]" />
+            <div aria-hidden="true" className="absolute right-0 top-0 hidden h-full w-[45%] bg-cover bg-center opacity-90 lg:block" style={{ backgroundImage: "linear-gradient(90deg, #0B2433 0%, rgba(11,36,51,0.80) 28%, rgba(11,36,51,0.20) 100%), url('https://images.unsplash.com/photo-1500530855697-b586d89ba3ee?auto=format&fit=crop&w=1100&q=85')" }} />
+            <div className="relative z-10 max-w-3xl">
+              <p className="inline-flex items-center gap-2 rounded-full border border-[#57DCC6]/25 bg-[#071B28]/60 px-3 py-1.5 text-[10px] font-extrabold uppercase tracking-[0.18em] text-[#78E7D4] sm:text-xs"><Sparkles size={14} /> Your next escape starts here <span className="h-1.5 w-1.5 rounded-full bg-[#57DCC6] shadow-[0_0_10px_rgba(87,220,198,0.75)]" /></p>
+              <h1 className="mt-4 max-w-2xl text-3xl font-extrabold leading-[1.08] tracking-[-0.04em] text-white sm:text-4xl lg:text-[2.8rem]">Where do you want to go?</h1>
+              <p className="mt-3 max-w-xl text-sm leading-6 text-[#C0D2DE] sm:text-base">Start with a place. RoamWise finds ideas around your interests, checks locations, then builds a route that makes sense.</p>
+              <div className="mt-5 flex flex-wrap items-center gap-2 text-[11px] font-semibold text-[#B2CAD7] sm:text-xs">
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-[#061A27]/50 px-3 py-1.5"><MapPin size={13} className="text-[#70E6D2]" /> Real places</span>
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-[#061A27]/50 px-3 py-1.5"><Compass size={13} className="text-[#70E6D2]" /> Route-aware days</span>
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-[#061A27]/50 px-3 py-1.5"><Wallet size={13} className="text-[#70E6D2]" /> Your budget</span>
+              </div>
+            </div>
           </div>
 
-          <form onSubmit={generateItinerary} className="mt-5 rounded-2xl border border-[#29485C] bg-[#0B2030] p-5 shadow-[0_18px_50px_rgba(0,0,0,0.16)] sm:p-7">
-            <div className="grid gap-5 sm:grid-cols-2">
-              <div className={fieldLabelClass}>
-                <label htmlFor="trip-destination" className="mb-2 flex items-center gap-2"><MapPin size={16} className="text-[#70E6D2]" /> Destination</label>
+          <form onSubmit={generateItinerary} className="mt-4 min-w-0 rounded-[28px] border border-[#29485C] bg-gradient-to-b from-[#0D2636] to-[#091B28] p-4 shadow-[0_24px_70px_rgba(0,0,0,0.19)] sm:mt-5 sm:p-6 lg:p-7">
+            <div className="mb-5 flex flex-col gap-2 border-b border-white/[0.07] pb-4 sm:flex-row sm:items-end sm:justify-between">
+              <div>
+                <p className="text-[10px] font-extrabold uppercase tracking-[0.18em] text-[#70E6D2]">Trip builder · Step 1</p>
+                <h2 className="mt-1 text-xl font-bold tracking-tight text-white sm:text-2xl">Make it your kind of trip</h2>
+              </div>
+              
+            </div>
+            <div className="grid min-w-0 grid-cols-1 gap-x-6 gap-y-6 sm:gap-x-7 sm:gap-y-7 lg:grid-cols-2">
+              <div className="min-w-0 lg:col-span-2">
+                <div className="rounded-2xl border border-[#57DCC6]/35 bg-[linear-gradient(135deg,rgba(22,67,78,0.64),rgba(7,27,41,0.96)_62%)] p-4 shadow-[0_12px_35px_rgba(0,0,0,0.12)] sm:rounded-3xl sm:p-5">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <label htmlFor="trip-destination" className="flex items-center gap-2 text-sm font-bold text-white sm:text-base"><span className="grid h-8 w-8 place-items-center rounded-xl border border-[#57DCC6]/20 bg-[#0A2A36] text-[#70E6D2]"><MapPin size={17} /></span> Destination <span className="text-[#70E6D2]">*</span></label>
+                    <span className="inline-flex items-center gap-1.5 rounded-full border border-[#57DCC6]/20 bg-[#071B28]/65 px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.12em] text-[#88B9C6]"><span className="h-1.5 w-1.5 rounded-full bg-[#57DCC6]" /> Start here</span>
+                  </div>
                 <div className="relative">
-                  <Search size={17} aria-hidden="true" className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-[#7E98AA]" />
+                  <Search size={21} aria-hidden="true" className="pointer-events-none absolute left-5 top-1/2 -translate-y-1/2 text-[#70E6D2]" />
                   <input
                     id="trip-destination"
                     required
@@ -1089,7 +1430,7 @@ export default function Home() {
                         }
                       }}}
                     placeholder="Type at least 2 letters to search cities and destinations..."
-                    className={`${fieldClass} pl-11`}
+                    className={`${fieldClass} h-[62px] rounded-xl border-[#3B6F7E] bg-[#061925] pl-14 pr-4 text-base font-semibold shadow-inner shadow-black/25 placeholder:text-[#6E8A9D] focus:border-[#57DCC6] focus:ring-4 focus:ring-[#57DCC6]/10 sm:h-[70px] sm:text-lg`}
                   />
                   {destinationSuggestionsOpen && (
                     <div
@@ -1134,82 +1475,113 @@ export default function Home() {
                     </div>
                   )}
                 </div>
+                  <div className="mt-2.5 flex flex-wrap items-center justify-between gap-2 text-[11px] leading-5 text-[#86A5B7] sm:text-xs">
+                    <span>Search a city, town, region or nearby area.</span>
+                    <span className="inline-flex items-center gap-1.5 text-[#78CFC2]"><Search size={12} /> Smart destination suggestions</span>
+                  </div>
+                </div>
               </div>
 
-              <label className={fieldLabelClass}>
+              <label className={`${fieldLabelClass} min-w-0 lg:col-start-1 lg:row-start-2`}>
                 <span className="mb-2 flex items-center gap-2"><CalendarDays size={16} className="text-[#70E6D2]" /> Duration</span>
                 <select value={duration} onChange={(event) => { setDuration(event.target.value); clearPlanResult() }} className={fieldClass}>
                   {[1, 2, 3, 4, 5, 6, 7].map((day) => <option key={day} value={String(day)}>{day} {day === 1 ? 'day' : 'days'}</option>)}
                 </select>
               </label>
 
-              <div className={fieldLabelClass}>
-                <label htmlFor="trip-budget" className="mb-2 flex items-center gap-2"><Wallet size={16} className="text-[#70E6D2]" /> Total budget (₹)</label>
-                <input
-                  id="trip-budget"
-                  required
-                  type="number"
-                  min="500"
-                  max="100000"
-                  step="500"
-                  value={budget}
-                  onChange={(event) => { setBudget(event.target.value); clearPlanResult() }}
-                  className={fieldClass}
-                />
-                <div className="mt-3 rounded-xl border border-[#2B4A60] bg-[#091B2A]/70 px-3.5 py-3">
-                  <div className="flex items-center justify-between gap-3 text-xs">
-                    <span className="text-[#8EA9BB]">Adjust your budget</span>
-                    <span className="font-bold tabular-nums text-[#78E7D4]">₹{Number(budget || 0).toLocaleString('en-IN')}</span>
-                  </div>
-                  <input
-                    aria-label="Adjust total trip budget"
-                    type="range"
-                    min="500"
-                    max="100000"
-                    step="500"
-                    value={Math.min(100000, Math.max(500, Number(budget) || 500))}
-                    onChange={(event) => { setBudget(event.target.value); clearPlanResult() }}
-                    className="mt-3 w-full cursor-pointer accent-[#57DCC6]"
-                  />
-                  <div className="flex justify-between text-[11px] font-medium text-[#7894A7]">
-                    <span>₹500</span>
-                    <span>₹1,00,000</span>
-                  </div>
-                </div>
-              </div>
-
-              <label className={fieldLabelClass}>
+              <label className={`${fieldLabelClass} min-w-0 lg:col-start-2 lg:row-start-2`}>
                 <span className="mb-2 flex items-center gap-2"><Users size={16} className="text-[#70E6D2]" /> Travelers</span>
                 <select value={travelers} onChange={(event) => { setTravelers(event.target.value); clearPlanResult() }} className={fieldClass}>
                   {[1, 2, 3, 4, 5, 6].map((count) => <option key={count} value={String(count)}>{count} {count === 1 ? 'traveler' : 'travelers'}</option>)}
                 </select>
               </label>
 
-              <label className={`${fieldLabelClass} sm:col-span-2`}>
-                <span className="mb-2 block">Transportation preference</span>
+              <div className={`${fieldLabelClass} min-w-0 lg:col-start-1 lg:row-start-3`}>
+                <div className="mb-2 flex flex-wrap items-center justify-between gap-3">
+                  <label htmlFor="trip-budget" className="flex items-center gap-2"><Wallet size={16} className="text-[#70E6D2]" /> Total budget</label>
+                  <div role="group" aria-label="Budget currency" className="inline-flex rounded-xl border border-[#2B4A60] bg-[#061724] p-1">
+                    <button type="button" onClick={() => void changeBudgetCurrency('INR')} disabled={currencyRateLoading} aria-pressed={budgetCurrency === 'INR'} className={`rounded-lg px-3 py-1.5 text-xs font-bold transition ${budgetCurrency === 'INR' ? 'bg-[#174653] text-[#8AECDD]' : 'text-[#9CB5C6] hover:text-white'}`}>₹ INR</button>
+                    <button type="button" onClick={() => void changeBudgetCurrency('USD')} disabled={currencyRateLoading} aria-pressed={budgetCurrency === 'USD'} className={`rounded-lg px-3 py-1.5 text-xs font-bold transition ${budgetCurrency === 'USD' ? 'bg-[#174653] text-[#8AECDD]' : 'text-[#9CB5C6] hover:text-white'}`}>$ USD</button>
+                  </div>
+                </div>
+                <div className="mt-2 grid min-w-0 gap-4 rounded-2xl border border-[#2B4A60] bg-[#071B28]/45 p-3 sm:p-4 md:grid-cols-[minmax(130px,0.38fr)_minmax(0,1fr)] md:items-center md:gap-6">
+                  <input
+                    id="trip-budget"
+                    required
+                    type="number"
+                    min={budgetMin}
+                    max={budgetMax}
+                    step={budgetCurrency === 'USD' ? '0.01' : '1'}
+                    value={budget}
+                    onChange={(event) => { setBudget(event.target.value); clearPlanResult() }}
+                    className={`${fieldClass} h-12 text-lg font-extrabold tabular-nums`}
+                  />
+                  <div className="min-w-0 px-1 py-1">
+                    <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs">
+                      <span className="text-[#8EA9BB]">Adjust your budget</span>
+                      <span className="font-bold tabular-nums text-[#78E7D4]">{formatBudgetCurrency(Number(budget || 0), budgetCurrency)}</span>
+                    </div>
+                    <input
+                      aria-label="Adjust total trip budget"
+                      type="range"
+                      min={budgetMin}
+                      max={budgetMax}
+                      step={budgetCurrency === 'USD' ? '1' : '100'}
+                      value={Math.min(budgetMax, Math.max(budgetMin, Number(budget) || budgetMin))}
+                      onChange={(event) => { setBudget(event.target.value); clearPlanResult() }}
+                      className="mt-3 w-full cursor-pointer accent-[#57DCC6]"
+                    />
+                    <div className="flex justify-between gap-4 text-[10px] font-medium text-[#7894A7]">
+                      <span>{formatBudgetCurrency(budgetMin, budgetCurrency)}</span>
+                      <span>{formatBudgetCurrency(budgetMax, budgetCurrency)}</span>
+                    </div>
+                  </div>
+                </div>
+                {currencyRateLoading && <p className="mt-2 text-xs text-[#8EA9BB]">Loading daily USD/INR reference rate…</p>}
+                {currencyRateError && <p role="alert" className="mt-2 text-xs text-rose-200">{currencyRateError}</p>}
+                {budgetCurrency === 'USD' && usdInrRate && <p className="mt-2 text-xs leading-5 text-[#819BAD]">Reference rate: $1 ≈ {formatINR(usdInrRate)} INR{usdInrRateDate ? ` · ${usdInrRateDate}` : ''}. {usdInrRateSource?.toLowerCase().includes('exchange') ? <a href="https://www.exchangerate-api.com/docs/free" target="_blank" rel="noreferrer" className="text-[#78E7D4] underline underline-offset-2">ExchangeRate-API source</a> : usdInrRateSource ? `Source: ${usdInrRateSource}.` : null} Currency conversion applies only to your entered planning budget; no trip-cost estimate is generated.</p>}
+              </div>
+
+              <label className={`${fieldLabelClass} min-w-0 lg:col-start-2 lg:row-start-3`}>
+                <span className="mb-2 flex items-center gap-2"><Compass size={16} className="text-[#70E6D2]" /> Transportation preference</span>
                 <select value={transport} onChange={(event) => { setTransport(event.target.value); clearPlanResult() }} className={fieldClass}>
                   {['Flexible', 'Public transport', 'Walking', 'Cab', 'Rental vehicle'].map((option) => <option key={option}>{option}</option>)}
                 </select>
               </label>
             </div>
 
-            <fieldset className="mt-6">
+            <fieldset className="mt-6 overflow-hidden rounded-2xl border border-[#29485C] bg-[#071B28]/55 p-4 sm:mt-7 sm:rounded-3xl sm:p-5">
               <legend className="sr-only">What are you interested in?</legend>
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <p className="text-sm font-semibold text-[#D9E7F1]">What are you interested in?</p>
-                <button
-                  type="button"
-                  onClick={toggleAllInterests}
-                  aria-pressed={allInterestsSelected}
-                  className="rounded-full border border-[#57DCC6]/35 bg-[#0D2A37] px-3 py-1.5 text-xs font-bold text-[#8AECDD] transition hover:border-[#57DCC6]/70 hover:bg-[#123D43]"
-                >
-                  {allInterestsSelected ? 'Clear all' : 'Select all'}
-                </button>
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div>
+                  <p className="text-[10px] font-extrabold uppercase tracking-[0.18em] text-[#70E6D2]">Step 2 · Your vibe</p>
+                  <h3 className="mt-1 text-lg font-bold tracking-tight text-white sm:text-xl">What sounds like your kind of adventure?</h3>
+                  
+                </div>
+                <div className="flex shrink-0 items-center gap-2 self-start">
+                  <span className="rounded-full border border-[#2B4A60] bg-[#091E2C] px-2.5 py-1.5 text-[10px] font-bold text-[#9CB6C6]">{interests.length} selected</span>
+                  <button
+                    type="button"
+                    onClick={toggleAllInterests}
+                    aria-pressed={allInterestsSelected}
+                    className="rounded-full border border-[#57DCC6]/35 bg-[#0D2A37] px-3.5 py-2 text-xs font-bold text-[#8AECDD] transition hover:border-[#57DCC6]/70 hover:bg-[#123D43]"
+                  >
+                    {allInterestsSelected ? 'Clear all' : 'Select all'}
+                  </button>
+                </div>
               </div>
-              <p className="mt-1.5 text-xs text-[#819BAD]">Choose a few interests or select all. “Popular / hot” favors well-known must-visit places; it is not a live trend feed.</p>
-              <div className="mt-3 flex flex-wrap gap-2">
+              
+              <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
                 {interestOptions.map((interest) => {
                   const selected = interests.includes(interest)
+                  const emoji: Record<string, string> = {
+                    Nature: '🌿',
+                    History: '🏛️',
+                    'Local food': '🍜',
+                    Adventure: '🧭',
+                    Photography: '📷',
+                    'Popular / hot': '🔥',
+                  }
                   const isPopular = interest === 'Popular / hot'
                   return (
                     <button
@@ -1217,9 +1589,13 @@ export default function Home() {
                       type="button"
                       aria-pressed={selected}
                       onClick={() => { toggleInterest(interest); clearPlanResult() }}
-                      className={`inline-flex items-center gap-1.5 rounded-full border px-3.5 py-2 text-sm transition ${selected ? 'border-[#57DCC6]/60 bg-[#123D43] font-semibold text-[#8AECDD]' : 'border-[#2B4A60] bg-[#091B2A] text-[#B1C4D2] hover:border-[#57DCC6]/45 hover:text-white'}`}
+                      className={`group flex min-h-[76px] min-w-0 flex-col items-start justify-between gap-2 rounded-xl border p-3 text-left transition duration-200 sm:min-h-[84px] sm:p-3.5 ${selected ? (isPopular ? 'border-amber-300/45 bg-[linear-gradient(145deg,rgba(111,75,28,0.26),rgba(10,32,45,0.94))] text-[#FFE2A8] shadow-[inset_0_1px_rgba(255,255,255,0.04)]' : 'border-[#57DCC6]/45 bg-[linear-gradient(145deg,rgba(22,67,78,0.64),rgba(8,29,42,0.96))] text-[#A4F2E5] shadow-[inset_0_1px_rgba(255,255,255,0.05)]') : 'border-[#29485C] bg-[#091E2C] text-[#AFC4D3] hover:border-[#57DCC6]/40 hover:bg-[#0D2938] hover:text-white'}`}
                     >
-                      {selected && <Check size={14} />}{isPopular ? '🔥 ' : ''}{interest}
+                      <span className="flex w-full items-center justify-between gap-2">
+                        <span className="text-lg leading-none sm:text-xl">{emoji[interest]}</span>
+                        {selected && <Check size={14} className="shrink-0 text-current" aria-hidden="true" />}
+                      </span>
+                      <span className="break-words text-xs font-semibold leading-4 sm:text-sm">{interest}</span>
                     </button>
                   )
                 })}
@@ -1231,8 +1607,8 @@ export default function Home() {
                 {planError}
               </div>
             )}
-            <div className="mt-7 flex flex-wrap items-center gap-3">
-              <button disabled={isGenerating} type="submit" className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-[#25BCA5] to-[#379CC4] px-5 py-3.5 font-bold text-[#041923] shadow-[0_8px_24px_rgba(37,188,165,0.16)] transition hover:brightness-110 disabled:cursor-wait disabled:opacity-80 sm:w-auto">
+            <div className="mt-6 flex flex-col items-stretch gap-3 sm:mt-7 sm:flex-row sm:flex-wrap sm:items-center">
+              <button disabled={isGenerating} type="submit" className="inline-flex w-full shrink-0 items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-[#38D3B9] via-[#3BC7C4] to-[#5EBDEB] px-6 py-3.5 font-extrabold text-[#041923] shadow-[0_12px_30px_rgba(37,188,165,0.20)] transition hover:-translate-y-0.5 hover:brightness-110 disabled:translate-y-0 disabled:cursor-wait disabled:opacity-80 sm:w-auto sm:min-w-[230px]">
                 {isGenerating ? <LoaderCircle size={17} className="animate-spin" aria-hidden="true" /> : <Sparkles size={17} aria-hidden="true" />}
                 {isGenerating ? 'Generating itinerary…' : 'Generate itinerary'}
                 {!isGenerating && <ArrowRight size={17} aria-hidden="true" />}
@@ -1244,7 +1620,7 @@ export default function Home() {
                 </p>
               )}
             </div>
-            <p className="mt-3 text-xs leading-5 text-[#819BAD]">Hosted Gemma recommends the places; Geoapify is used to resolve destinations and place coordinates. OpenStreetMap-based routing is best-effort. Costs are illustrative estimates, not live quotes or bookings.</p>
+           
           </form>
 
           {trip && (
@@ -1254,11 +1630,7 @@ export default function Home() {
                   <div>
                     <p className="inline-flex items-center gap-2 text-[11px] font-extrabold uppercase tracking-[0.16em] text-[#78E7D4]"><Sparkles size={14} /> Your journey at a glance · itinerary #{trip.id}</p>
                     <h2 className="mt-2 text-2xl font-extrabold tracking-tight text-white sm:text-3xl">{trip.destination} · {trip.duration} {trip.duration === 1 ? 'day' : 'days'}</h2>
-                    <p className="mt-2 text-sm text-[#B4C7D6]">{trip.travelers} {trip.travelers === 1 ? 'traveler' : 'travelers'} <span className="mx-1 text-[#55778A]">·</span> {trip.transport} <span className="mx-1 text-[#55778A]">·</span> {formatINR(trip.budget)} group budget</p>
-                  </div>
-                  <div className={`inline-flex shrink-0 items-center gap-2 self-start rounded-full border px-3.5 py-2 text-sm font-bold ${trip.is_within_budget ? 'border-[#57DCC6]/25 bg-[#123D43] text-[#8AECDD]' : 'border-rose-300/25 bg-rose-400/10 text-rose-100'}`}>
-                    <span className={`h-2 w-2 rounded-full ${trip.is_within_budget ? 'bg-[#57DCC6]' : 'bg-rose-300'}`} />
-                    {trip.is_within_budget ? `${formatINR(trip.budget_breakdown.remaining)} remaining` : `${formatINR(trip.budget_breakdown.amount_over_budget)} over budget`}
+                    <p className="mt-2 text-sm text-[#B4C7D6]">{trip.travelers} {trip.travelers === 1 ? 'traveler' : 'travelers'} <span className="mx-1 text-[#55778A]">·</span> {trip.transport} <span className="mx-1 text-[#55778A]">·</span> {formatBudgetCurrency(trip.budget_input_amount ?? trip.budget, trip.budget_currency ?? 'INR')} group budget{trip.budget_currency === 'USD' ? ` (≈ ${formatINR(trip.budget)})` : ''}</p>
                   </div>
                 </div>
 
@@ -1278,8 +1650,75 @@ export default function Home() {
                     </div>
                   </div>
                   <ItineraryMap destination={trip.destination} itinerary={trip.itinerary} />
-                  <p className="border-t border-[#29485C] px-4 py-3 text-[11px] leading-5 text-[#7898AC] sm:px-5">Map tiles © OpenStreetMap contributors. Road routes are fetched from the public OSRM demo service when available; they are driving-route previews, not live traffic or guaranteed navigation. Cost figures are illustrative estimates, not live prices.</p>
+                  <p className="border-t border-[#29485C] px-4 py-3 text-[11px] leading-5 text-[#7898AC] sm:px-5">Map tiles © OpenStreetMap contributors. Road routes are fetched from the public OSRM demo service when available; they are driving-route previews, not live traffic or guaranteed navigation.</p>
                 </div>
+
+                <section className="mt-7 overflow-hidden rounded-2xl border border-[#2B5967] bg-gradient-to-br from-[#0D2938] to-[#081B28]" aria-labelledby="other-places-title">
+                  <div className="border-b border-[#29485C] p-4 sm:p-5">
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                      <div className="min-w-0">
+                        <p className="inline-flex items-center gap-2 text-[10px] font-extrabold uppercase tracking-[0.16em] text-[#78E7D4]"><Trees size={14} /> Optional add-on · 100 km radius</p>
+                        <h3 id="other-places-title" className="mt-1 text-xl font-extrabold text-white sm:text-2xl">Other places to explore</h3>
+                        <p className="mt-2 max-w-2xl text-sm leading-6 text-[#AFC4D3]">Discover more nearby sights, wildlife sanctuaries, nature reserves, viewpoints, heritage spots and activities based on your interests. Select the places you want, then generate a separate optimized route.</p>
+                        <p className="mt-2 text-xs leading-5 text-[#7F9DAF]">Your original itinerary stays exactly as it is. Extra stops are saved in a separate section, not added to your main trip.</p>
+                      </div>
+                      <button type="button" onClick={() => void discoverOtherPlaces()} disabled={otherPlacesLoading} className="inline-flex shrink-0 items-center justify-center gap-2 rounded-xl border border-[#57DCC6]/35 bg-[#123B45] px-4 py-2.5 text-sm font-bold text-[#8AECDD] transition hover:border-[#57DCC6]/70 hover:bg-[#174A55] disabled:cursor-wait disabled:opacity-65">
+                        {otherPlacesLoading ? <LoaderCircle size={16} className="animate-spin" aria-hidden="true" /> : <Search size={16} aria-hidden="true" />}
+                        {otherPlacesLoading ? 'Finding nearby places…' : otherPlacesLoaded ? 'Refresh places' : 'Find places nearby'}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="p-4 sm:p-5">
+                    {otherPlacesLoading && <div role="status" className="flex items-center gap-3 rounded-xl border border-[#29485C] bg-[#071A27] p-4 text-sm text-[#AFC4D3]"><LoaderCircle size={18} className="animate-spin text-[#78E7D4]" /> Gemma is finding additional places and verifying coordinates within 100 km. You can keep using the page.</div>}
+                    {otherPlacesError && <p role="status" className="mt-3 rounded-xl border border-amber-200/20 bg-amber-100/5 px-3 py-2.5 text-sm leading-5 text-amber-100">{otherPlacesError}</p>}
+
+                    {otherPlaces.length > 0 && (
+                      <>
+                        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                          <p className="text-xs font-semibold text-[#9DB6C6]">{otherPlaces.length} mapped options · select up to 8 for one optimized route</p>
+                          <div className="flex flex-wrap gap-2">
+                            <button type="button" onClick={() => setSelectedOtherPlaceIds(otherPlaces.slice(0, 8).map((place) => place.id))} className="rounded-full border border-[#29485C] px-3 py-1.5 text-[11px] font-bold text-[#B4C7D6] transition hover:border-[#57DCC6]/45 hover:text-white">Select first 8</button>
+                            <button type="button" onClick={() => setSelectedOtherPlaceIds([])} className="rounded-full border border-[#29485C] px-3 py-1.5 text-[11px] font-bold text-[#B4C7D6] transition hover:border-[#57DCC6]/45 hover:text-white">Clear selection</button>
+                          </div>
+                        </div>
+                        <div className="grid min-w-0 gap-3 sm:grid-cols-2 xl:grid-cols-3">
+                          {otherPlaces.map((place) => {
+                            const selected = selectedOtherPlaceIds.includes(place.id)
+                            const isWildlife = /wildlife|sanctuary|national park|nature reserve|debrigarh|bird sanctuary/i.test(`${place.name} ${place.category}`)
+                            return (
+                              <label key={place.id} className={`flex min-w-0 cursor-pointer gap-3 rounded-2xl border p-4 transition ${selected ? 'border-[#57DCC6]/65 bg-[#123B43]/70 shadow-[0_0_0_1px_rgba(87,220,198,0.10)]' : 'border-[#29485C] bg-[#081B28] hover:border-[#57DCC6]/35 hover:bg-[#0C2533]'}`}>
+                                <input type="checkbox" checked={selected} onChange={() => toggleOtherPlace(place.id)} disabled={!selected && selectedOtherPlaceIds.length >= 8} className="mt-1 h-4 w-4 shrink-0 accent-[#57DCC6]" />
+                                <span className="min-w-0 flex-1">
+                                  <span className="flex flex-wrap items-center gap-2">
+                                    <span className="break-words text-sm font-extrabold leading-5 text-white">{place.name}</span>
+                                    {isWildlife && <span className="rounded-full border border-emerald-300/25 bg-emerald-300/10 px-2 py-0.5 text-[9px] font-bold uppercase tracking-wide text-emerald-100">Wildlife & nature</span>}
+                                  </span>
+                                  <span className="mt-1 block text-[11px] font-semibold text-[#78E7D4]">{place.category} <span className="mx-1 text-[#4E7185]">·</span> {place.distance_from_destination_km.toFixed(1)} km away</span>
+                                  <span className="mt-2 block text-xs leading-5 text-[#AFC4D3]">{place.recommendation_reason || place.description}</span>
+                                  {place.address && <span className="mt-2 block text-[10px] leading-4 text-[#7896A9]">{place.address}</span>}
+                                  {place.maps_url && <a href={place.maps_url} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()} className="mt-2 inline-flex text-[11px] font-bold text-[#78E7D4] hover:underline">Check map listing ↗</a>}
+                                </span>
+                              </label>
+                            )
+                          })}
+                        </div>
+                        <div className="mt-4 flex flex-col gap-3 rounded-2xl border border-[#29485C] bg-[#071A27] p-4 sm:flex-row sm:items-center sm:justify-between">
+                          <div>
+                            <p className="text-sm font-bold text-white">{selectedOtherPlaceIds.length} place{selectedOtherPlaceIds.length === 1 ? '' : 's'} selected</p>
+                            <p className="mt-1 text-xs leading-5 text-[#819BAD]">We’ll start at the destination center and optimize the order of your selected stops using the existing route optimizer.</p>
+                          </div>
+                          <button type="button" onClick={() => void createExplorationRoute()} disabled={generatingExplorationRoute || selectedOtherPlaceIds.length === 0} className="inline-flex shrink-0 items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-[#38D3B9] to-[#5EBDEB] px-5 py-3 text-sm font-extrabold text-[#041923] shadow-[0_10px_25px_rgba(37,188,165,0.16)] transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-45">
+                            {generatingExplorationRoute ? <LoaderCircle size={16} className="animate-spin" aria-hidden="true" /> : <Route size={16} aria-hidden="true" />}
+                            {generatingExplorationRoute ? 'Optimizing route…' : 'Generate optimized route'}
+                          </button>
+                        </div>
+                        {explorationRouteError && <p role="status" className="mt-3 rounded-xl border border-amber-200/20 bg-amber-100/5 px-3 py-2.5 text-sm leading-5 text-amber-100">{explorationRouteError}</p>}
+                      </>
+                    )}
+                    {!otherPlacesLoading && !otherPlacesLoaded && !otherPlacesError && <p className="rounded-xl border border-dashed border-[#29485C] bg-[#081B28]/75 p-4 text-sm leading-6 text-[#9BB3C3]">Find additional places around {trip.destination}. We’ll include wildlife sanctuaries and nature reserves within range when they can be verified, such as Debrigarh Wildlife Sanctuary near Hirakud.</p>}
+                  </div>
+                </section>
 
                 <div className="mt-7 flex items-end justify-between gap-4">
                   <div>
@@ -1326,32 +1765,6 @@ export default function Home() {
                   ))}
                 </div>
 
-                <div className="mt-6 rounded-2xl border border-[#29485C] bg-[#081B28] p-5 sm:p-6">
-                  <div className="flex flex-col justify-between gap-2 sm:flex-row sm:items-end">
-                    <div>
-                      <p className="text-[11px] font-extrabold uppercase tracking-[0.16em] text-[#78E7D4]">Budget snapshot</p>
-                      <h3 className="mt-1 text-lg font-bold text-white">Illustrative group cost estimate</h3>
-                    </div>
-                    <p className="text-xl font-extrabold tabular-nums text-white">{formatINR(trip.budget_breakdown.total)}</p>
-                  </div>
-                  <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
-                    {[
-                      ['Transport', trip.budget_breakdown.transportation],
-                      ['Stay', trip.budget_breakdown.accommodation],
-                      ['Food', trip.budget_breakdown.food],
-                      ['Entry', trip.budget_breakdown.entry_fees],
-                      ['Misc.', trip.budget_breakdown.miscellaneous],
-                      ['Total', trip.budget_breakdown.total],
-                    ].map(([label, amount]) => (
-                      <div key={String(label)} className={`rounded-xl border p-3 ${label === 'Total' ? 'border-[#57DCC6]/25 bg-[#123D43]/60' : 'border-[#29485C] bg-[#0C2232]'}`}>
-                        <p className="text-xs text-[#8EA9BB]">{label}</p>
-                        <p className="mt-1 text-sm font-extrabold tabular-nums text-white">{String(label) === 'Entry' ? 'Unknown' : formatINR(Number(amount))}</p>
-                      </div>
-                    ))}
-                  </div>
-                  <p className="mt-4 text-xs leading-5 text-[#819BAD]">{trip.budget_breakdown.estimate_note} Planner: {trip.planner_engine}.</p>
-                </div>
-
                 {trip.interests.length > 0 && (
                   <div className="mt-5 flex flex-wrap items-center gap-2 text-sm text-[#B4C7D6]">
                     <strong className="mr-1 text-white">Your interests</strong>
@@ -1362,26 +1775,139 @@ export default function Home() {
             </section>
           )}
 
-          <section className="mt-6 rounded-2xl border border-[#29485C] bg-[#0B2030] p-5 sm:p-7">
-            <div className="flex items-center justify-between gap-4">
-              <div>
-                <p className="text-xs font-bold uppercase tracking-[0.14em] text-[#78E7D4]">Saved trips</p>
-                <h2 className="mt-1 text-xl font-bold text-white">Reopen a previous plan</h2>
+          {activeExplorationRoute && (
+            <section id="active-exploration-route" className="mt-5 overflow-hidden rounded-3xl border border-[#2B5967] bg-[#0A202D] shadow-[0_22px_70px_rgba(0,0,0,0.18)]" aria-live="polite">
+              <div className="flex flex-col justify-between gap-3 border-b border-[#29485C] p-4 sm:flex-row sm:items-start sm:p-6">
+                <div className="min-w-0">
+                  <p className="inline-flex items-center gap-2 text-[10px] font-extrabold uppercase tracking-[0.16em] text-[#78E7D4]"><Route size={14} /> Separately saved exploration route · #{activeExplorationRoute.id}</p>
+                  <h2 className="mt-2 text-xl font-extrabold text-white sm:text-2xl">{activeExplorationRoute.title || `Extra places near ${activeExplorationRoute.destination}`}</h2>
+                  <p className="mt-2 text-sm leading-6 text-[#AFC4D3]">{activeExplorationRoute.places.length} selected stops · starts at the destination center · the main itinerary is unchanged.</p>
+                </div>
+                <button type="button" onClick={() => setActiveExplorationRoute(null)} className="self-start rounded-full border border-[#29485C] px-3 py-2 text-xs font-semibold text-[#B4C7D6] transition hover:border-[#57DCC6]/45 hover:text-white">Close route preview</button>
               </div>
-              <button type="button" onClick={() => void loadSavedTrips()} className="rounded-full border border-[#2B4A60] px-3 py-2 text-xs font-semibold text-[#B4C7D6] transition hover:border-[#57DCC6]/50 hover:text-white">Refresh</button>
-            </div>
-            {savedTripsError && <p role="status" className="mt-4 text-sm text-amber-100">{savedTripsError}</p>}
-            {savedTrips.length > 0 ? (
-              <div className="mt-4 grid gap-3 sm:grid-cols-2">
-                {savedTrips.map((savedTrip) => (
-                  <button key={savedTrip.id} type="button" disabled={openingTripId === savedTrip.id} onClick={() => void openSavedTrip(savedTrip.id)} className="rounded-xl border border-[#2B4A60] bg-[#091E2C] p-4 text-left transition hover:border-[#57DCC6]/45 disabled:opacity-60">
-                    <span className="block text-sm font-bold text-white">{savedTrip.destination} · {savedTrip.duration} days</span>
-                    <span className="mt-1 block text-xs text-[#8EA9BB]">Plan #{savedTrip.id} · {formatINR(savedTrip.budget_breakdown.total)} estimated</span>
-                    <span className="mt-2 block text-xs font-semibold text-[#70E6D2]">{openingTripId === savedTrip.id ? 'Opening…' : 'Open saved plan'}</span>
-                  </button>
+              <div className="px-4 pt-4 sm:px-6">
+                <div className="flex flex-wrap gap-2">
+                  <span className="rounded-full border border-[#29485C] bg-[#081B28] px-3 py-1.5 text-xs text-[#B4C7D6]">{Math.round(activeExplorationRoute.travel_minutes_estimate || 0)} min travel estimate</span>
+                  <span className="rounded-full border border-[#29485C] bg-[#081B28] px-3 py-1.5 text-xs text-[#B4C7D6]">{Number(activeExplorationRoute.travel_distance_km_estimate || 0).toFixed(1)} km route estimate</span>
+                  <span className="rounded-full border border-[#29485C] bg-[#081B28] px-3 py-1.5 text-xs text-[#B4C7D6]">100 km discovery radius</span>
+                </div>
+              </div>
+              <div className="m-4 overflow-hidden rounded-2xl border border-[#29485C] bg-[#081B28] sm:m-6">
+                <div className="border-b border-[#29485C] px-4 py-3">
+                  <h3 className="text-sm font-bold text-white">Optimized extra-place path</h3>
+                  <p className="mt-1 text-xs leading-5 text-[#8FAABD]">The original route above is preserved; this is a separate optional route.</p>
+                </div>
+                <ItineraryMap destination={activeExplorationRoute.destination} itinerary={[{
+                  day: 1,
+                  theme: 'Other places to explore',
+                  activities: activeExplorationRoute.places,
+                  route_path: activeExplorationRoute.route_path,
+                  route_path_source: activeExplorationRoute.route_path_source,
+                  route_time_source: activeExplorationRoute.route_time_source,
+                  travel_minutes_estimate: activeExplorationRoute.travel_minutes_estimate,
+                  travel_distance_km_estimate: activeExplorationRoute.travel_distance_km_estimate,
+                }]} />
+                <p className="border-t border-[#29485C] px-4 py-3 text-[11px] leading-5 text-[#7898AC]">{activeExplorationRoute.route_path_source}. Route duration and distances are estimates, not live navigation. Map tiles © OpenStreetMap contributors.</p>
+              </div>
+              <div className="grid gap-3 p-4 pt-0 sm:grid-cols-2 sm:p-6 sm:pt-0 lg:grid-cols-3">
+                {activeExplorationRoute.places.map((place, index) => (
+                  <article key={`${activeExplorationRoute.id}-${place.place_id || place.attraction_id}-${index}`} className="rounded-xl border border-[#29485C] bg-[#081B28] p-4">
+                    <div className="flex items-start gap-3">
+                      <span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-[#57DCC6] text-xs font-extrabold text-[#061923]">{String(index + 1).padStart(2, '0')}</span>
+                      <div className="min-w-0">
+                        <h3 className="break-words text-sm font-extrabold leading-5 text-white">{place.name}</h3>
+                        <p className="mt-1 text-[11px] font-semibold text-[#78E7D4]">{place.category}</p>
+                      </div>
+                    </div>
+                    <p className="mt-3 text-xs leading-5 text-[#AFC4D3]">{place.description}</p>
+                    {place.address && <p className="mt-2 text-[10px] leading-4 text-[#7896A9]">{place.address}</p>}
+                    {place.maps_url && <a href={place.maps_url} target="_blank" rel="noreferrer" className="mt-3 inline-flex text-[11px] font-bold text-[#78E7D4] hover:underline">Open map listing ↗</a>}
+                  </article>
                 ))}
               </div>
-            ) : !savedTripsError && <p className="mt-4 text-sm text-[#8EA9BB]">Generate a plan to save it here.</p>}
+            </section>
+          )}
+
+          <section className="mt-5 min-w-0 overflow-hidden rounded-2xl border border-[#29485C] bg-[#0B2030] p-4 sm:mt-6 sm:p-5 lg:p-6">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <p className="text-xs font-bold uppercase tracking-[0.14em] text-[#78E7D4]">Saved exploration routes</p>
+                  <span className="rounded-full border border-[#2B4A60] bg-[#091E2C] px-2 py-0.5 text-[10px] font-bold text-[#9CB6C6]">{savedExplorationRoutes.length} saved</span>
+                </div>
+                <h2 className="mt-1 text-lg font-bold text-white sm:text-xl">Your extra routes, kept separately</h2>
+                
+              </div>
+              <div className="flex shrink-0 flex-wrap items-center gap-2">
+                <button type="button" onClick={() => void loadSavedExplorationRoutes()} className="inline-flex items-center justify-center rounded-full border border-[#2B4A60] px-3 py-2 text-xs font-semibold text-[#B4C7D6] transition hover:border-[#57DCC6]/50 hover:text-white">Refresh</button>
+                <button type="button" onClick={() => setSavedExplorationRoutesExpanded((expanded) => !expanded)} aria-expanded={savedExplorationRoutesExpanded} aria-controls="saved-exploration-routes-panel" className="inline-flex items-center justify-center gap-2 rounded-full border border-[#57DCC6]/35 bg-[#0D2A37] px-3.5 py-2 text-xs font-bold text-[#8AECDD] transition hover:border-[#57DCC6]/70 hover:bg-[#123D43]">
+                  {savedExplorationRoutesExpanded ? 'Minimize' : 'Show saved routes'}
+                  {savedExplorationRoutesExpanded ? <ChevronUp size={15} aria-hidden="true" /> : <ChevronDown size={15} aria-hidden="true" />}
+                </button>
+              </div>
+            </div>
+            <div id="saved-exploration-routes-panel" hidden={!savedExplorationRoutesExpanded}>
+              {savedExplorationRoutesError && <p role="status" className="mt-4 rounded-xl border border-amber-300/20 bg-amber-200/5 px-3 py-2 text-sm text-amber-100">{savedExplorationRoutesError}</p>}
+              {savedExplorationRoutes.length > 0 ? (
+                <div className="mt-4 grid min-w-0 gap-3 lg:grid-cols-2">
+                  {savedExplorationRoutes.map((route) => (
+                    <div key={route.id} className="flex min-w-0 items-start gap-3 rounded-xl border border-[#2B4A60] bg-[#091E2C] p-4">
+                      <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl border border-[#57DCC6]/20 bg-[#123D43] text-[#78E7D4]"><Route size={18} /></span>
+                      <div className="min-w-0 flex-1">
+                        <button type="button" onClick={() => openExplorationRoute(route)} className="block w-full break-words text-left text-sm font-extrabold leading-5 text-white hover:text-[#8AECDD]">{route.title || `Explore near ${route.destination}`}</button>
+                        <p className="mt-1 text-xs text-[#8EA9BB]">{route.places.length} stops · {Number(route.travel_distance_km_estimate || 0).toFixed(1)} km estimated</p>
+                        <p className="mt-1 text-[10px] text-[#6F91A5]">Saved {route.created_at ? new Date(route.created_at).toLocaleDateString() : 'previously'}</p>
+                        <button type="button" onClick={() => openExplorationRoute(route)} className="mt-2 text-xs font-bold text-[#78E7D4] hover:underline">Open route preview ↗</button>
+                      </div>
+                      <button type="button" onClick={() => void removeExplorationRoute(route.id)} disabled={deletingExplorationRouteId === route.id} title="Delete saved exploration route" aria-label={`Delete ${route.title}`} className="rounded-lg border border-[#29485C] p-2 text-[#93AFC0] transition hover:border-rose-300/35 hover:text-rose-200 disabled:opacity-50">
+                        {deletingExplorationRouteId === route.id ? <LoaderCircle size={15} className="animate-spin" /> : <Trash2 size={15} />}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : !savedExplorationRoutesError && <p className="mt-4 text-sm text-[#8EA9BB]">Generate an optimized extra-place route and it will be saved here, separately from your itinerary.</p>}
+            </div>
+          </section>
+
+          <section className="mt-5 min-w-0 overflow-hidden rounded-2xl border border-[#29485C] bg-[#0B2030] p-4 sm:mt-6 sm:p-5 lg:p-6">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <p className="text-xs font-bold uppercase tracking-[0.14em] text-[#78E7D4]">Saved trips</p>
+                  <span className="rounded-full border border-[#2B4A60] bg-[#091E2C] px-2 py-0.5 text-[10px] font-bold text-[#9CB6C6]">{savedTrips.length} {savedTrips.length === 1 ? 'plan' : 'plans'}</span>
+                </div>
+                <h2 className="mt-1 text-lg font-bold text-white sm:text-xl">Reopen a previous plan</h2>
+                
+              </div>
+              <div className="flex shrink-0 flex-wrap items-center gap-2">
+                <button type="button" onClick={() => void loadSavedTrips()} className="inline-flex items-center justify-center rounded-full border border-[#2B4A60] px-3 py-2 text-xs font-semibold text-[#B4C7D6] transition hover:border-[#57DCC6]/50 hover:text-white">Refresh</button>
+                <button
+                  type="button"
+                  onClick={() => setSavedTripsExpanded((expanded) => !expanded)}
+                  aria-expanded={savedTripsExpanded}
+                  aria-controls="saved-trips-panel"
+                  className="inline-flex items-center justify-center gap-2 rounded-full border border-[#57DCC6]/35 bg-[#0D2A37] px-3.5 py-2 text-xs font-bold text-[#8AECDD] transition hover:border-[#57DCC6]/70 hover:bg-[#123D43]"
+                >
+                  {savedTripsExpanded ? 'Minimize' : 'Show saved trips'}
+                  {savedTripsExpanded ? <ChevronUp size={15} aria-hidden="true" /> : <ChevronDown size={15} aria-hidden="true" />}
+                </button>
+              </div>
+            </div>
+
+            <div id="saved-trips-panel" hidden={!savedTripsExpanded}>
+              {savedTripsError && <p role="status" className="mt-4 rounded-xl border border-amber-300/20 bg-amber-200/5 px-3 py-2 text-sm text-amber-100">{savedTripsError}</p>}
+              {savedTrips.length > 0 ? (
+                <div className="mt-4 grid min-w-0 grid-cols-1 gap-3 lg:grid-cols-2">
+                  {savedTrips.map((savedTrip) => (
+                    <button key={savedTrip.id} type="button" disabled={openingTripId === savedTrip.id} onClick={() => void openSavedTrip(savedTrip.id)} className="min-w-0 w-full rounded-xl border border-[#2B4A60] bg-[#091E2C] p-4 text-left transition hover:border-[#57DCC6]/45 disabled:opacity-60">
+                      <span className="block break-words text-sm font-bold leading-5 text-white">{savedTrip.destination} · {savedTrip.duration} {savedTrip.duration === 1 ? 'day' : 'days'}</span>
+                      <span className="mt-1 block text-xs text-[#8EA9BB]">Plan #{savedTrip.id} · {savedTrip.travelers} {savedTrip.travelers === 1 ? 'traveler' : 'travelers'} · {savedTrip.transport}</span>
+                      <span className="mt-2 block text-xs font-semibold text-[#70E6D2]">{openingTripId === savedTrip.id ? 'Opening…' : 'Open saved plan'}</span>
+                    </button>
+                  ))}
+                </div>
+              ) : !savedTripsError && <p className="mt-4 text-sm text-[#8EA9BB]">Generate a plan to save it here.</p>}
+            </div>
           </section>
         </section>
       )}

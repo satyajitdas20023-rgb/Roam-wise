@@ -37,6 +37,8 @@ OSRM_FOOT_BASE = os.getenv("ROAMWISE_OSRM_FOOT_BASE", "https://routing.openstree
 MAX_CANDIDATES_FOR_ROUTING = 12
 SUPPORTED_TRANSPORT = {"Flexible", "Public transport", "Walking", "Cab", "Rental vehicle"}
 MAX_BUDGET_INR = 100_000
+USD_INR_CACHE_SECONDS = 6 * 60 * 60
+_USD_INR_CACHE: dict[str, Any] = {"rate": None, "updated_at": None, "fetched_at": 0.0}
 
 # Respect the shared FOSSGIS OSRM demo limit (about one request per second).
 _OSRM_REQUEST_LOCK = threading.Lock()
@@ -46,46 +48,76 @@ _OSRM_LAST_REQUEST_FINISHED = 0.0
 # never used to generate itineraries; users can plan any destination.
 EXPLORE_DESTINATIONS = [
     {
-        "id": 1, "name": "New York", "region": "USA",
+        "id": 1, "name": "Tokyo", "region": "Japan",
+        "description": "Neon-lit streets, peaceful shrines, incredible food and pop culture.",
+        "image_url": "https://images.unsplash.com/photo-1540959733332-eab4deabeeaf?auto=format&fit=crop&w=900&q=85",
+        "tag": "City & culture",
+    },
+    {
+        "id": 2, "name": "Paris", "region": "France",
+        "description": "World-class art, café-lined streets, river walks and iconic landmarks.",
+        "image_url": "https://images.unsplash.com/photo-1502602898657-3e91760cbb34?auto=format&fit=crop&w=900&q=85",
+        "tag": "Art & romance",
+    },
+    {
+        "id": 3, "name": "London", "region": "United Kingdom",
+        "description": "Historic landmarks, lively markets, museums and theatre nights.",
+        "image_url": "https://images.unsplash.com/photo-1513635269975-59663e0ac1ad?auto=format&fit=crop&w=900&q=85",
+        "tag": "History & city life",
+    },
+    {
+        "id": 4, "name": "New York", "region": "United States",
         "description": "Iconic parks, neighbourhoods, museums and skyline views.",
         "image_url": "https://images.unsplash.com/photo-1485871981521-5b1fd3805eee?auto=format&fit=crop&w=900&q=85",
         "tag": "City icons",
     },
     {
-        "id": 2, "name": "Puri", "region": "Odisha, India",
+        "id": 5, "name": "Singapore", "region": "Singapore",
+        "description": "Futuristic gardens, waterfront architecture and legendary hawker food.",
+        "image_url": "https://images.unsplash.com/photo-1525625293386-3f8f99389edd?auto=format&fit=crop&w=900&q=85",
+        "tag": "Food & skyline",
+    },
+    {
+        "id": 6, "name": "Bali", "region": "Indonesia",
+        "description": "Lush rice terraces, volcanic scenery, temples and surf beaches.",
+        "image_url": "https://images.unsplash.com/photo-1537996194471-e657df975ab4?auto=format&fit=crop&w=900&q=85",
+        "tag": "Island escape",
+    },
+    {
+        "id": 7, "name": "Rome", "region": "Italy",
+        "description": "Ancient ruins, grand piazzas, art and unforgettable Italian food.",
+        "image_url": "https://images.unsplash.com/photo-1552832230-c0197dd311b5?auto=format&fit=crop&w=900&q=85",
+        "tag": "Ancient history",
+    },
+    {
+        "id": 8, "name": "Dubai", "region": "United Arab Emirates",
+        "description": "Modern architecture, desert experiences, souks and waterfront dining.",
+        "image_url": "https://images.unsplash.com/photo-1512453979798-5ea266f8880c?auto=format&fit=crop&w=900&q=85",
+        "tag": "Modern & desert",
+    },
+    {
+        "id": 9, "name": "Bangkok", "region": "Thailand",
+        "description": "Golden temples, night markets, river trips and bold street food.",
+        "image_url": "https://images.unsplash.com/photo-1508009603885-50cf7c579365?auto=format&fit=crop&w=900&q=85",
+        "tag": "Food & temples",
+    },
+    {
+        "id": 10, "name": "Puri", "region": "Odisha, India",
         "description": "Temple heritage, ocean sunsets and local Odia food.",
         "image_url": "https://images.unsplash.com/photo-1593693397690-362cb9666fc2?auto=format&fit=crop&w=900&q=85",
         "tag": "Culture & coast",
     },
     {
-        "id": 3, "name": "Goa", "region": "India",
+        "id": 11, "name": "Goa", "region": "India",
         "description": "Beach days, Portuguese heritage and laid-back cafés.",
         "image_url": "https://images.unsplash.com/photo-1512343879784-a960bf40e7f2?auto=format&fit=crop&w=900&q=85",
         "tag": "Beach escape",
     },
     {
-        "id": 4, "name": "Jaipur", "region": "Rajasthan, India",
-        "description": "Colourful markets, forts and remarkable architecture.",
+        "id": 12, "name": "Jaipur", "region": "Rajasthan, India",
+        "description": "Colourful markets, forts and beautiful architecture.",
         "image_url": "https://images.unsplash.com/photo-1599661046289-e31897846e41?auto=format&fit=crop&w=900&q=85",
         "tag": "History & culture",
-    },
-    {
-        "id": 5, "name": "Manali", "region": "Himachal Pradesh, India",
-        "description": "Mountain views, fresh air and scenic trails.",
-        "image_url": "https://images.unsplash.com/photo-1626621341517-bbf3d9990a23?auto=format&fit=crop&w=900&q=85",
-        "tag": "Mountain break",
-    },
-    {
-        "id": 6, "name": "Meghalaya", "region": "Northeast India",
-        "description": "Misty hills, waterfalls and lush green landscapes.",
-        "image_url": "https://images.unsplash.com/photo-1500530855697-b586d89ba3ee?auto=format&fit=crop&w=900&q=85",
-        "tag": "Nature & adventure",
-    },
-    {
-        "id": 7, "name": "Varanasi", "region": "Uttar Pradesh, India",
-        "description": "Riverfront walks, old streets and living traditions.",
-        "image_url": "https://images.unsplash.com/photo-1561361058-c24cecae35ca?auto=format&fit=crop&w=900&q=85",
-        "tag": "Heritage",
     },
 ]
 
@@ -98,6 +130,8 @@ INTEREST_TERMS: dict[str, tuple[str, ...]] = {
     "adventure": ("adventure", "hiking", "climbing", "rafting", "outdoor", "ski", "trail", "amusement"),
     "photography": ("viewpoint", "scenic", "lookout", "landmark", "garden", "skyline", "waterfront"),
     "popular / hot": ("popular", "famous", "iconic", "well known", "well-known", "must-see", "must see", "top attraction", "hotspot", "hot spot"),
+    "wildlife": ("wildlife", "sanctuary", "national park", "nature reserve", "forest", "birding", "debrigarh", "safari", "eco tourism"),
+    "wildlife sanctuary": ("wildlife", "sanctuary", "national park", "nature reserve", "forest", "birding", "debrigarh", "safari", "eco tourism"),
     "hidden gems": ("local", "village", "craft", "neighbourhood", "neighborhood", "market", "art district"),
 }
 
@@ -170,7 +204,10 @@ def _init_database(app: Flask) -> None:
                 expense_breakdown JSON NOT NULL,
                 itinerary JSON NOT NULL,
                 created_at DATETIME NOT NULL,
-                planner_engine VARCHAR(120) NOT NULL DEFAULT 'legacy saved plan'
+                planner_engine VARCHAR(120) NOT NULL DEFAULT 'legacy saved plan',
+                budget_currency VARCHAR(3) NOT NULL DEFAULT 'INR',
+                budget_input_amount REAL NOT NULL DEFAULT 0,
+                budget_exchange_rate REAL
             )
             """
         )
@@ -180,10 +217,71 @@ def _init_database(app: Flask) -> None:
             connection.execute(
                 "ALTER TABLE trips ADD COLUMN planner_engine VARCHAR(120) NOT NULL DEFAULT 'legacy saved plan'"
             )
+        if "budget_currency" not in columns:
+            connection.execute("ALTER TABLE trips ADD COLUMN budget_currency VARCHAR(3) NOT NULL DEFAULT 'INR'")
+        if "budget_input_amount" not in columns:
+            connection.execute("ALTER TABLE trips ADD COLUMN budget_input_amount REAL NOT NULL DEFAULT 0")
+        if "budget_exchange_rate" not in columns:
+            connection.execute("ALTER TABLE trips ADD COLUMN budget_exchange_rate REAL")
         connection.execute("CREATE INDEX IF NOT EXISTS ix_trips_created_at ON trips (created_at)")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS exploration_routes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                destination VARCHAR(160) NOT NULL,
+                interests JSON NOT NULL,
+                transport VARCHAR(80) NOT NULL,
+                route_data JSON NOT NULL,
+                created_at DATETIME NOT NULL
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS ix_exploration_routes_created_at ON exploration_routes (created_at)")
         connection.commit()
     finally:
         connection.close()
+
+
+def _get_usd_inr_rate() -> dict[str, Any]:
+    """Return a cached daily USD→INR reference rate; no key or Google billing needed."""
+    now = time.time()
+    cached_rate = _USD_INR_CACHE.get("rate")
+    cached_at = float(_USD_INR_CACHE.get("fetched_at") or 0.0)
+    if cached_rate and now - cached_at < USD_INR_CACHE_SECONDS:
+        return {"rate": float(cached_rate), "updated_at": _USD_INR_CACHE.get("updated_at"), "source": "ExchangeRate-API"}
+
+    try:
+        response = requests.get(
+            "https://open.er-api.com/v6/latest/USD",
+            headers=_service_headers(),
+            timeout=(3, 7),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        rates = payload.get("rates") if isinstance(payload, dict) else None
+        rate = float((rates or {}).get("INR", 0))
+        if not isinstance(payload, dict) or payload.get("result") != "success" or rate <= 0 or not math.isfinite(rate):
+            raise ValueError("Currency endpoint did not provide a valid INR rate")
+        _USD_INR_CACHE.update({"rate": rate, "updated_at": payload.get("time_last_update_utc"), "fetched_at": now})
+        return {"rate": rate, "updated_at": payload.get("time_last_update_utc"), "source": "ExchangeRate-API"}
+    except (requests.RequestException, ValueError, TypeError) as error:
+        # An optional administrator-configured rate lets a developer keep USD input
+        # usable when the public daily rate endpoint is temporarily unavailable.
+        fallback = os.getenv("USD_INR_RATE", "").strip()
+        try:
+            fallback_rate = float(fallback) if fallback else 0.0
+        except ValueError:
+            fallback_rate = 0.0
+        if cached_rate and float(cached_rate) > 0:
+            current_app.logger.warning("Using the previously cached USD/INR rate after refresh failure (%s).", type(error).__name__)
+            return {"rate": float(cached_rate), "updated_at": _USD_INR_CACHE.get("updated_at"), "source": "ExchangeRate-API (cached)"}
+        if fallback_rate > 0 and math.isfinite(fallback_rate):
+            current_app.logger.warning("Using USD_INR_RATE from backend/.env because the public exchange-rate endpoint failed.")
+            return {"rate": fallback_rate, "updated_at": "configured fallback rate", "source": "backend configuration"}
+        raise ApiProblem(
+            "The USD/INR reference rate is temporarily unavailable. Try INR or retry in a moment.",
+            503, "exchange_rate_unavailable",
+        ) from error
 
 
 def _validate_plan(payload: object) -> dict[str, Any]:
@@ -202,8 +300,15 @@ def _validate_plan(payload: object) -> dict[str, Any]:
         errors["duration"] = "Duration must be an integer between 1 and 7 days."
 
     budget = payload.get("budget")
-    if not isinstance(budget, (int, float)) or isinstance(budget, bool) or not 500 <= budget <= MAX_BUDGET_INR:
-        errors["budget"] = f"Budget must be between ₹500 and ₹{MAX_BUDGET_INR:,}."
+    budget_currency = str(payload.get("budget_currency", "INR")).upper().strip()
+    if budget_currency not in {"INR", "USD"}:
+        errors["budget_currency"] = "Budget currency must be INR or USD."
+    if not isinstance(budget, (int, float)) or isinstance(budget, bool) or not math.isfinite(float(budget)) or budget <= 0:
+        errors["budget"] = "Enter a positive budget amount."
+    elif budget_currency == "INR" and not 500 <= budget <= MAX_BUDGET_INR:
+        errors["budget"] = f"INR budget must be between ₹500 and ₹{MAX_BUDGET_INR:,}."
+    elif budget_currency == "USD" and not 1 <= budget <= 10000:
+        errors["budget"] = "USD budget must be between $1 and $10,000; the INR equivalent will be checked before planning."
 
     travelers = payload.get("travelers")
     if not isinstance(travelers, int) or isinstance(travelers, bool) or not 1 <= travelers <= 20:
@@ -225,7 +330,12 @@ def _validate_plan(payload: object) -> dict[str, Any]:
     return {
         "destination": destination.strip(),
         "duration": duration,
-        "budget": int(round(budget)),
+        # Internal planning and cost estimation use INR. The original entered
+        # amount/currency are preserved separately for form restoration/display.
+        "budget": int(round(budget)) if budget_currency == "INR" else 0,
+        "budget_currency": budget_currency,
+        "budget_input_amount": round(float(budget), 2),
+        "budget_exchange_rate": None,
         "travelers": travelers,
         "transport": transport,
         "interests": list(dict.fromkeys(item.strip() for item in interests)),
@@ -412,9 +522,15 @@ def _geocode_destination(destination: str, api_key: str) -> tuple[float, float, 
     return best["latitude"], best["longitude"], best["formatted"]
 
 
-def _generate_gemma_place_recommendations(plan: dict[str, Any], resolved_destination: str) -> list[dict[str, str]]:
-    """Gemma is the recommender. Geocoding happens only after the model has chosen names."""
-    count = min(20, max(10, plan["duration"] * 4 + len(plan["interests"])))
+def _generate_gemma_place_recommendations(
+    plan: dict[str, Any],
+    resolved_destination: str,
+    *,
+    broaden_to_popular: bool = False,
+    exclude_names: list[str] | None = None,
+) -> list[dict[str, str]]:
+    """Gemma is the recommender. In fallback mode, broaden to popular local sights matching interests."""
+    count = 16 if broaden_to_popular else min(20, max(10, plan["duration"] * 4 + len(plan["interests"])))
     schema = {
         "type": "OBJECT", "required": ["places"],
         "properties": {"places": {"type": "ARRAY", "items": {"type": "OBJECT",
@@ -422,36 +538,44 @@ def _generate_gemma_place_recommendations(plan: dict[str, Any], resolved_destina
             "properties": {"name": {"type": "STRING"}, "category": {"type": "STRING"},
                            "reason": {"type": "STRING"}, "area": {"type": "STRING"}}}}}
     }
-    prompt = f"""Recommend {count} real, specific visitor places or activity locations for a trip.
+    interests = json.dumps(plan["interests"], ensure_ascii=False)
+    exclusions = json.dumps((exclude_names or [])[:24], ensure_ascii=False)
+    if broaden_to_popular:
+        local_wildlife_hint = " For the Hirakud / Sambalpur / Burla area specifically, include Debrigarh Wildlife Sanctuary as one candidate because the user asked to see local wildlife options, even if the other selected interests are primary; Geoapify must still verify the name and coordinates within 100 km before the UI shows it. Also consider other real wildlife/nature destinations in range." if any(term in resolved_destination.casefold() for term in ("hirakud", "sambalpur", "burla")) else " Include wildlife sanctuaries, national parks, forest reserves and birding destinations where they genuinely exist within range; the geocoder must verify each name before it is shown."
+        task = f"""FALLBACK / OTHER PLACES TO EXPLORE MODE: the first recommendation pass did not produce enough places that could be mapped, or the user requested optional nearby places. Broaden the search to well-known and popular tourist attractions, landmarks, public visitor areas, scenic viewpoints, parks, markets, heritage sites, temples, beaches, activity areas, wildlife sanctuaries, national parks, nature reserves, forest/wetland destinations, birding areas, eco-tourism sites and other genuinely visitable locations in or near {resolved_destination}. Use the selected interests as strong preferences: {interests}. Cover different selected interests where real options exist, rather than returning only one category. Include established nearby attractions within a practical day trip (up to approximately 100 km) if the destination itself has few mapped sites. Prioritize selected interests but also provide a few popular regional alternatives so the list remains useful when the destination has sparse listings.{local_wildlife_hint} Prefer commonly known places with stable names/geographic identities that a geocoder can resolve. Do not invent businesses, operator names, opening status, ratings, prices, or current activity availability. Avoid these names already considered: {exclusions}. Return enough distinct alternatives to build multi-stop routes, ideally at least 12 valid places if you genuinely know them. Do not pad with made-up places."""
+    else:
+        task = f"""Recommend {count} real, specific visitor places or activity locations for a trip. Return actual named attractions, landmarks, activity hubs/operators, nature sites, heritage sites, and other visitor locations that fit the interests. Use local knowledge to recommend places specifically in or around this destination, and include nearby towns only when genuinely practical. For water sports around Sambalpur/Burla/Hirakud, explicitly consider Hirakud Dam, Zero Point, the Right Dyke/Silat Road area, boat rides, boating and water-sports operators/launch points if known there. If the user selected \"Popular / hot\", prioritize widely recognized, iconic, frequently recommended must-visit places, not an unverified claim about today's live trends. Do not recommend places in unrelated cities or countries. Avoid generic filler and duplicates. Prefer well-known real places. Never invent exact addresses, coordinates, place IDs, opening hours, ratings, prices, or live availability. If a niche operator name is uncertain, recommend a recognizable public access point or visitor area and say the activity/operator needs confirmation. Do not claim water sports operate today."""
+
+    prompt = f"""{task}
 Destination: {resolved_destination}
 User's original destination text: {plan['destination']}
-Interests: {json.dumps(plan['interests'], ensure_ascii=False)}
-Duration: {plan['duration']} days
-Budget: INR {plan['budget']} total for {plan['travelers']} traveller(s)
+Selected interests (all must guide relevance): {interests}
+Trip duration: {plan['duration']} days
+Total entered budget: {plan['budget_input_amount']} {plan.get('budget_currency', 'INR')} (internal comparison equivalent: INR {plan['budget']})
 Transport preference: {plan['transport']}
 
-You are the place recommender, not a search-query generator. Return actual named attractions, landmarks, activity hubs/operators, nature sites, heritage sites, and other visitor locations that fit the interests. Use local knowledge to recommend places that are specifically in or around this destination, and include relevant nearby towns only when genuinely practical. For water sports around Sambalpur/Burla/Hirakud, explicitly consider Hirakud Dam, Zero Point, the Right Dyke/Silat Road area, boat rides, boating and water-sports operators/launch points if they are known there. If the user selected "Popular / hot", prioritize widely recognized, iconic, frequently recommended must-visit places for the destination, not an unverified claim about today's live trends. Do not recommend places in unrelated cities or countries. Avoid generic filler and duplicates. Prefer well-known real places. Never invent exact addresses, coordinates, place IDs, opening hours, ratings, prices, or live availability. If the existence/name of a niche operator is uncertain, recommend a recognizable public access point or visitor area and say that the activity/operator needs confirmation. Do not claim water sports operate today.
-
 For each place, return:
-- name: the exact known name (or a specific named area/access point if that is the genuine recommendation)
-- category: short category such as Water sports, Boating, Landmark, Park, Museum, Temple, Viewpoint
+- name: the exact known name (or a specific named public area/access point if that is the genuine recommendation)
+- category: short category such as Water sports, Boating, Landmark, Park, Museum, Temple, Viewpoint, Beach, Market
 - reason: short explanation of why it fits the selected interests
 - area: local neighbourhood/road/town name that helps resolve it geographically
 
-Return JSON only: {{"places":[{{"name":"...","category":"...","reason":"...","area":"..."}}]}}. Return at least {min(10, count)} recommendations if you can name that many real relevant places; never pad the list with made-up entries."""
-    response = _call_gemma_json(prompt, schema, "place recommendations", max_tokens=3500)
+Only use locations that are genuinely in or reasonably near the named destination. Never invent exact addresses, coordinates or activity availability. Return JSON only: {{"places":[{{"name":"...","category":"...","reason":"...","area":"..."}}]}}."""
+    response = _call_gemma_json(prompt, schema, "popular-place fallback" if broaden_to_popular else "place recommendations", max_tokens=4200 if broaden_to_popular else 3500)
     raw_places = response.get("places", [])
     if not isinstance(raw_places, list):
         raise ApiProblem("Gemma did not return a valid place recommendation list. Please retry.", 502, "gemma_invalid_response")
     places: list[dict[str, str]] = []
     seen: set[str] = set()
+    excluded = {_normal_name(x) for x in (exclude_names or [])}
     for item in raw_places:
         if not isinstance(item, dict):
             continue
         name = re.sub(r"\s+", " ", str(item.get("name") or "")).strip(" \t\r\n\"'`.-")
-        if not name or len(name) > 140 or name.casefold() in seen:
+        normalized_name = _normal_name(name)
+        if not name or len(name) > 140 or normalized_name in seen or (broaden_to_popular and normalized_name in excluded):
             continue
-        seen.add(name.casefold())
+        seen.add(normalized_name)
         places.append({
             "name": name,
             "category": str(item.get("category") or "Point of interest").strip()[:80],
@@ -489,36 +613,30 @@ def _name_match_score(wanted: str, result: dict[str, Any]) -> float:
     return best
 
 
-def _discover_gemma_places(plan: dict[str, Any]) -> tuple[list[dict[str, Any]], str, dict[str, float]]:
-    """Gemma chooses recommended places; Geoapify only resolves those exact names to coordinates."""
-    api_key = _geoapify_key()
-    latitude, longitude, resolved_destination = _geocode_destination(plan["destination"], api_key)
-    recommendations = _generate_gemma_place_recommendations(plan, resolved_destination)
-    current_app.logger.info("Gemma proposed %d named locations for %r; resolving their coordinates.", len(recommendations), resolved_destination)
-    by_id: dict[str, dict[str, Any]] = {}
+def _resolve_gemma_recommendations(
+    recommendations: list[dict[str, str]], plan: dict[str, Any], resolved_destination: str,
+    latitude: float, longitude: float, api_key: str, by_id: dict[str, dict[str, Any]],
+    radius_km: float = 50.0,
+) -> tuple[list[str], int]:
+    """Resolve model-chosen names, rejecting weak matches and locations outside the requested radius."""
     unmapped: list[str] = []
     geocoding_failures = 0
     consecutive_geocoding_failures = 0
     for recommendation in recommendations:
-        # First try the fully contextualized recommendation. If an exact area plus
-        # destination is too restrictive for the geocoder, retry the shorter name
-        # with destination context while keeping the same 50 km geographic fence.
         query_parts = [recommendation["name"]]
         if recommendation["area"] and _normal_name(recommendation["area"]) not in _normal_name(recommendation["name"]):
             query_parts.append(recommendation["area"])
         query_parts.append(resolved_destination)
         primary_query = ", ".join(part for part in query_parts if part)
         fallback_query = ", ".join(part for part in [recommendation["name"], resolved_destination] if part)
-        lookup_queries = list(dict.fromkeys([primary_query, fallback_query]))
+        lookup_queries = list(dict.fromkeys([primary_query, fallback_query, recommendation["name"]]))
         scored: list[tuple[float, float, dict[str, Any], tuple[float, float]]] = []
-    
+
         for query_index, query in enumerate(lookup_queries):
             try:
-                results = _geoapify_geocode(query, api_key, center=(latitude, longitude), radius_km=50, limit=5)
+                results = _geoapify_geocode(query, api_key, center=(latitude, longitude), radius_km=radius_km, limit=5)
                 consecutive_geocoding_failures = 0
             except ApiProblem as error:
-                # Invalid keys and exhausted quotas should fail fast. A transient network/server
-                # failure for one name should not discard every other recommendation.
                 if error.code in {"geocoding_provider_error", "geocoding_quota_exceeded"}:
                     raise
                 geocoding_failures += 1
@@ -541,29 +659,23 @@ def _discover_gemma_places(plan: dict[str, Any]) -> tuple[list[dict[str, Any]], 
                 if not coords:
                     continue
                 distance = _distance_km(latitude, longitude, coords[0], coords[1])
-                if distance > 50:
+                if distance > radius_km:
                     continue
                 score = _name_match_score(recommendation["name"], result)
-                # Never accept a result that merely geocoded to the destination/city centre.
                 if score < 0.48:
                     continue
                 scored.append((score, distance, result, coords))
-
             if scored:
                 break
 
         if not scored:
             unmapped.append(recommendation["name"])
-            current_app.logger.info(
-                "Could not verify coordinates for Gemma recommendation %r after %d query variant(s).",
-                recommendation["name"][:100], len(lookup_queries),
-            )
+            current_app.logger.info("Could not verify coordinates for Gemma recommendation %r after %d query variant(s).", recommendation["name"][:100], len(lookup_queries))
             continue
 
         scored.sort(key=lambda entry: (-entry[0], entry[1]))
         score, distance, result, coords = scored[0]
         lat, lng = coords
-        # Avoid placing different model suggestions on top of the same geocoder result.
         if any(_distance_km(lat, lng, float(p["latitude"]), float(p["longitude"])) < 0.08 for p in by_id.values()):
             continue
         place_id = "gemma-" + hashlib.sha1(f"{recommendation['name'].casefold()}|{lat:.5f}|{lng:.5f}".encode("utf-8")).hexdigest()[:16]
@@ -585,9 +697,50 @@ def _discover_gemma_places(plan: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             "recommendation_reason": recommendation["reason"],
             "coordinate_match_score": round(score, 2),
         }
+    return unmapped, geocoding_failures
+
+
+def _discover_gemma_places(plan: dict[str, Any]) -> tuple[list[dict[str, Any]], str, dict[str, float]]:
+    """Gemma recommends attractions; if too few can be mapped, ask it for broader popular local options."""
+    api_key = _geoapify_key()
+    latitude, longitude, resolved_destination = _geocode_destination(plan["destination"], api_key)
+    recommendations = _generate_gemma_place_recommendations(plan, resolved_destination)
+    current_app.logger.info("Gemma proposed %d named locations for %r; resolving their coordinates.", len(recommendations), resolved_destination)
+    by_id: dict[str, dict[str, Any]] = {}
+    unmapped, geocoding_failures = _resolve_gemma_recommendations(
+        recommendations, plan, resolved_destination, latitude, longitude, api_key, by_id
+    )
+
+    # For destinations where the first pass maps only a handful of names, run one
+    # broader recommendation pass before planning. This is still Gemma choosing
+    # places; Geoapify is used only to verify/map the names. More stops make road
+    # paths useful (at least two stops per day where enough real places exist).
+    target_count = min(MAX_CANDIDATES_FOR_ROUTING, max(4, plan["duration"] * 2))
+    if len(by_id) < target_count:
+        current_app.logger.warning(
+            "Only %d places mapped near %r (target %d); requesting Gemma's popular-local-attractions fallback.",
+            len(by_id), resolved_destination, target_count,
+        )
+        try:
+            fallback_recommendations = _generate_gemma_place_recommendations(
+                plan, resolved_destination, broaden_to_popular=True,
+                exclude_names=[item["name"] for item in recommendations] + [place["name"] for place in by_id.values()],
+            )
+            fallback_unmapped, fallback_failures = _resolve_gemma_recommendations(
+                fallback_recommendations, plan, resolved_destination, latitude, longitude, api_key, by_id
+            )
+            unmapped.extend(fallback_unmapped)
+            geocoding_failures += fallback_failures
+        except ApiProblem as error:
+            # If the first pass already returned verified places, do not discard the
+            # usable trip just because the optional fallback model call failed.
+            if not by_id:
+                raise
+            current_app.logger.warning("Popular-place fallback did not complete (code=%s); keeping %d verified original/fallback places.", error.code, len(by_id))
+
     current_app.logger.info(
-        "Resolved %d/%d Gemma recommendations; %d could not be mapped and %d geocoding requests failed temporarily.",
-        len(by_id), len(recommendations), len(unmapped), geocoding_failures,
+        "Resolved %d Gemma recommendations near %r; %d names could not be mapped; %d geocoding attempts failed temporarily.",
+        len(by_id), resolved_destination, len(unmapped), geocoding_failures,
     )
     if len(by_id) < 1:
         if geocoding_failures:
@@ -601,11 +754,8 @@ def _discover_gemma_places(plan: dict[str, Any]) -> tuple[list[dict[str, Any]], 
     return _rank_places(list(by_id.values()), plan["interests"]), resolved_destination, {"latitude": latitude, "longitude": longitude}
 
 
-
-
-
 INTEREST_TERMS: dict[str, tuple[str, ...]] = {
-    "nature": ("nature", "park", "garden", "forest", "mountain", "waterfall", "lake", "trail", "scenic", "dam", "reservoir"),
+    "nature": ("nature", "wildlife", "sanctuary", "bird sanctuary", "birding", "national park", "nature reserve", "forest reserve", "eco-tourism", "ecotourism", "park", "garden", "forest", "mountain", "waterfall", "lake", "trail", "scenic", "dam", "reservoir"),
     "history": ("history", "historical", "museum", "monument", "fort", "palace", "landmark", "heritage", "memorial", "tower"),
     "temples": ("temple", "shrine", "worship", "religious", "church", "mosque", "monastery", "pagoda"),
     "beaches": ("beach", "coast", "seaside", "waterfront", "island", "bay"),
@@ -905,6 +1055,43 @@ def _optimize_activity_order(activities: list[dict[str, Any]], matrix: dict[str,
     return [activities[i] for i in best]
 
 
+def _optimize_activity_order_from_origin(
+    activities: list[dict[str, Any]], matrix: dict[str, dict[str, dict[str, Any]]], origin_id: str,
+) -> list[dict[str, Any]]:
+    """Minimize an open path that starts at the selected destination center."""
+    n = len(activities)
+    if n < 2:
+        return activities
+    ids = [str(activity.get("place_id") or activity.get("attraction_id") or "") for activity in activities]
+
+    def cost_id(a: str, b: str) -> int:
+        return max(0, _matrix_minutes(matrix, a, b))
+
+    # Exploration routes are limited to eight selected stops, so exact permutations
+    # keep the starting point fixed and are reliably optimal for the supplied matrix.
+    if n <= 8:
+        from itertools import permutations
+        best_order = tuple(range(n))
+        best_cost = float("inf")
+        for order in permutations(range(n)):
+            total = cost_id(origin_id, ids[order[0]])
+            total += sum(cost_id(ids[a], ids[b]) for a, b in zip(order, order[1:]))
+            if total < best_cost:
+                best_cost, best_order = total, order
+        return [activities[i] for i in best_order]
+
+    remaining = set(range(n))
+    first = min(remaining, key=lambda idx: (cost_id(origin_id, ids[idx]), idx))
+    order = [first]
+    remaining.remove(first)
+    while remaining:
+        last = order[-1]
+        nxt = min(remaining, key=lambda idx: (cost_id(ids[last], ids[idx]), idx))
+        order.append(nxt)
+        remaining.remove(nxt)
+    return [activities[i] for i in order]
+
+
 def _matrix_minutes(matrix: dict[str, dict[str, dict[str, Any]]], origin_id: str, destination_id: str) -> int:
     try:
         return int(matrix[origin_id][destination_id]["minutes"])
@@ -1025,36 +1212,111 @@ def _generate_gemma_itinerary(plan: dict[str, Any], places: list[dict[str, Any]]
     return itinerary
 
 
-def _attach_open_route_paths(itinerary: list[dict[str, Any]], plan: dict[str, Any], places_by_id: dict[str, dict[str, Any]]) -> None:
-    """Attach OSRM route geometry for the stop sequence, when the public router supports it."""
-    base, _mode = _routing_base(plan.get("transport", "Flexible"))
+def _attach_open_route_paths(
+    itinerary: list[dict[str, Any]], plan: dict[str, Any],
+    places_by_id: dict[str, dict[str, Any]], center: dict[str, float] | None = None,
+    always_start_from_center: bool = False,
+) -> None:
+    """Attach OSRM road geometry; optional exploration routes always start at the destination center."""
+    base, mode_label = _routing_base(plan.get("transport", "Flexible"))
     for day in itinerary:
         activities = day.get("activities", [])
         stops = [places_by_id.get(str(a.get("place_id") or a.get("attraction_id"))) for a in activities]
         stops = [p for p in stops if p and p.get("latitude") is not None and p.get("longitude") is not None]
-        if len(stops) < 2 or not base:
+        if not stops:
             day["route_path"] = []
+            day["route_path_source"] = "no mapped stops"
             continue
-        coordinates = ";".join(f"{float(p['longitude'])},{float(p['latitude'])}" for p in stops)
-        try:
-            response = _osrm_get(f"{base}/route/v1/driving/{coordinates}",
-                                 params={"overview": "full", "geometries": "geojson", "steps": "false"},
-                                 timeout=(5, 20))
-            if not response.ok:
-                day["route_path"] = []
+
+        single_stop_origin = False
+        route_stops = stops
+        if always_start_from_center and center and center.get("latitude") is not None and center.get("longitude") is not None:
+            origin = {"latitude": float(center["latitude"]), "longitude": float(center["longitude"])}
+            if _distance_km(origin["latitude"], origin["longitude"], float(stops[0]["latitude"]), float(stops[0]["longitude"])) > 0.25:
+                route_stops = [origin, *stops]
+                single_stop_origin = True
+            else:
+                # Avoid drawing a fake zero-length segment at the origin.
+                route_stops = stops
+        elif len(stops) == 1:
+            # When only one place can be verified, preserve a saved route path if present.
+            existing_path = day.get("route_path") or []
+            if len(existing_path) >= 2:
                 continue
-            payload = response.json()
-            routes = payload.get("routes", []) if isinstance(payload, dict) else []
-            route = routes[0] if routes else {}
-            coords = ((route.get("geometry") or {}).get("coordinates") or []) if isinstance(route, dict) else []
-            day["route_path"] = [{"latitude": float(pt[1]), "longitude": float(pt[0])} for pt in coords if isinstance(pt, (list, tuple)) and len(pt) >= 2]
-            if route.get("duration") is not None:
-                day["travel_minutes_estimate"] = int(round(float(route["duration"]) / 60))
-            if route.get("distance") is not None:
-                day["travel_distance_km_estimate"] = round(float(route["distance"]) / 1000, 1)
-        except (requests.RequestException, ValueError, TypeError, KeyError) as error:
-            current_app.logger.warning("OSRM route geometry unavailable for day %s (%s).", day.get("day"), type(error).__name__)
-            day["route_path"] = []
+            if center and center.get("latitude") is not None and center.get("longitude") is not None:
+                origin = {"latitude": float(center["latitude"]), "longitude": float(center["longitude"])}
+                if _distance_km(origin["latitude"], origin["longitude"], float(stops[0]["latitude"]), float(stops[0]["longitude"])) > 0.25:
+                    route_stops = [origin, stops[0]]
+                    single_stop_origin = True
+                else:
+                    day["route_path"] = []
+                    day["route_path_source"] = "destination center is at the stop"
+                    continue
+            else:
+                day["route_path"] = []
+                day["route_path_source"] = "single stop; no destination center available"
+                continue
+
+        coordinates = ";".join(f"{float(p['longitude'])},{float(p['latitude'])}" for p in route_stops)
+        route_bases: list[tuple[str, str]] = []
+        if base:
+            provider_label = f"OpenStreetMap OSRM {mode_label}"
+            if single_stop_origin:
+                provider_label += " from destination center"
+            route_bases.append((base.rstrip("/"), provider_label))
+        # Public OSRM demo endpoint is a second no-key fallback for driving paths.
+        # For walking/public-transport preferences this is only geometry fallback,
+        # not a claim that the path or travel time matches that transport mode.
+        if plan.get("transport") != "Walking":
+            alt = "https://router.project-osrm.org"
+            if all(url != alt for url, _ in route_bases):
+                provider_label = "OSRM public driving geometry fallback"
+                if single_stop_origin:
+                    provider_label += " from destination center"
+                route_bases.append((alt, provider_label))
+        if plan.get("transport") == "Public transport":
+            provider_label = "OSRM road geometry preview; transit times estimated"
+            if single_stop_origin:
+                provider_label += " from destination center"
+            route_bases.append((OSRM_CAR_BASE.rstrip("/"), provider_label))
+
+        got_path = False
+        for route_base, provider_name in route_bases:
+            try:
+                response = _osrm_get(
+                    f"{route_base}/route/v1/driving/{coordinates}",
+                    params={"overview": "full", "geometries": "geojson", "steps": "false"},
+                    timeout=(5, 20),
+                )
+                if not response.ok:
+                    current_app.logger.warning("OSRM route geometry provider returned HTTP %s for day %s.", response.status_code, day.get("day"))
+                    continue
+                payload = response.json()
+                routes = payload.get("routes", []) if isinstance(payload, dict) else []
+                route = routes[0] if routes else {}
+                coords = ((route.get("geometry") or {}).get("coordinates") or []) if isinstance(route, dict) else []
+                if not isinstance(coords, list) or len(coords) < 2:
+                    continue
+                day["route_path"] = [{"latitude": float(pt[1]), "longitude": float(pt[0])} for pt in coords if isinstance(pt, (list, tuple)) and len(pt) >= 2]
+                day["route_path_source"] = provider_name
+                if route.get("duration") is not None and plan.get("transport") != "Public transport":
+                    day["travel_minutes_estimate"] = int(round(float(route["duration"]) / 60))
+                if route.get("distance") is not None:
+                    day["travel_distance_km_estimate"] = round(float(route["distance"]) / 1000, 1)
+                got_path = True
+                break
+            except (requests.RequestException, ValueError, TypeError, KeyError) as error:
+                current_app.logger.warning("OSRM route geometry provider failed for day %s (%s).", day.get("day"), type(error).__name__)
+
+        if not got_path:
+            # At least show the planned order on the map. This is intentionally
+            # labelled as a straight-line estimate, never as a road route.
+            day["route_path"] = [
+                {"latitude": float(stop["latitude"]), "longitude": float(stop["longitude"])}
+                for stop in route_stops
+            ]
+            day["route_path_source"] = "straight-line estimate; road routing unavailable" + (" from destination center" if single_stop_origin else "")
+            current_app.logger.warning("No OSRM path available for day %s; attached labelled straight-line fallback.", day.get("day"))
 
 
 def _parse_model_json(text: str) -> dict[str, Any]:
@@ -1105,44 +1367,6 @@ def _gemma_response_text(response: Any) -> str:
     return "\n".join(collected).strip()
 
 
-def _estimate_budget(plan: dict[str, Any], itinerary: list[dict[str, Any]]) -> dict[str, Any]:
-    """Very rough INR planning assumptions; never represent these as live prices."""
-    person_days = plan["duration"] * plan["travelers"]
-    transport_per_person_day = {
-        "Walking": 120,
-        "Public transport": 300,
-        "Flexible": 450,
-        "Cab": 900,
-        "Rental vehicle": 1400,
-    }[plan["transport"]]
-    accommodation = 1200 * person_days
-    food = 700 * person_days
-    transportation = transport_per_person_day * person_days
-    # Ticket/admission costs are unknown: do not make up a number or add them.
-    entry_fees = 0
-    miscellaneous = round((accommodation + food + transportation) * 0.08)
-    total = accommodation + food + transportation + entry_fees + miscellaneous
-    submitted = plan["budget"]
-    return {
-        "currency": "INR",
-        "transportation": transportation,
-        "accommodation": accommodation,
-        "food": food,
-        "entry_fees": entry_fees,
-        "miscellaneous": miscellaneous,
-        "total": total,
-        "submitted_budget": submitted,
-        "remaining": max(submitted - total, 0),
-        "amount_over_budget": max(total - submitted, 0),
-        "is_within_budget": total <= submitted,
-        "costs_are_estimates": True,
-        "estimate_note": (
-            "Illustrative INR placeholders only, not destination-specific quotes. Place discovery does not provide verified ticket, "
-            "accommodation, or transport prices; attraction entry fees are excluded. Verify costs before travel."
-        ),
-    }
-
-
 def _itinerary_for_storage(itinerary: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Store model recommendation text and verified coordinates; no provider billing key is needed to reopen it."""
     stored_days: list[dict[str, Any]] = []
@@ -1174,7 +1398,9 @@ def _itinerary_for_storage(itinerary: list[dict[str, Any]]) -> list[dict[str, An
                             "travel_minutes_estimate": day.get("travel_minutes_estimate"),
                             "travel_distance_km_estimate": day.get("travel_distance_km_estimate"),
                             "route_time_source": day.get("route_time_source", "saved estimate"),
-                            "route_path": day.get("route_path", []), "activities": activities})
+                            "route_path": day.get("route_path", []),
+                            "route_path_source": str(day.get("route_path_source") or "")[:160],
+                            "activities": activities})
     return stored_days
 
 
@@ -1201,22 +1427,22 @@ def _hydrate_saved_trip(trip: dict[str, Any]) -> dict[str, Any]:
 
 
 def _trip_from_row(row: sqlite3.Row) -> dict[str, Any]:
-    breakdown = json.loads(row["expense_breakdown"] or "{}")
+    # Older database rows may contain illustrative cost breakdowns. Do not expose
+    # those legacy estimates in newly returned trip payloads.
     itinerary = json.loads(row["itinerary"] or "[]")
     budget = int(row["total_budget"])
-    total = int(breakdown.get("total", 0))
     return {
         "id": int(row["id"]),
         "destination": row["destination"],
         "duration": int(row["duration"]),
-        "budget": budget,
+        "budget": budget,  # normalized planning budget in INR
+        "budget_currency": str(row["budget_currency"] or "INR") if "budget_currency" in row.keys() else "INR",
+        "budget_input_amount": (float(row["budget_input_amount"]) if "budget_input_amount" in row.keys() and float(row["budget_input_amount"] or 0) > 0 else float(budget)),
+        "budget_exchange_rate": (float(row["budget_exchange_rate"]) if "budget_exchange_rate" in row.keys() and row["budget_exchange_rate"] is not None else None),
         "travelers": int(row["travelers"]),
         "transport": row["transport"],
         "interests": json.loads(row["interests"] or "[]"),
         "itinerary": itinerary,
-        "budget_breakdown": breakdown,
-        "is_within_budget": bool(breakdown.get("is_within_budget", total <= budget)),
-        "costs_are_estimates": True,
         "planner_engine": row["planner_engine"] or "legacy saved plan",
         "created_at": str(row["created_at"]).replace(" ", "T", 1),
     }
@@ -1230,14 +1456,18 @@ def _save_trip(plan: dict[str, Any]) -> dict[str, Any]:
             """
             INSERT INTO trips (
                 destination, duration, total_budget, travelers, transport,
-                interests, expense_breakdown, itinerary, created_at, planner_engine
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                interests, expense_breakdown, itinerary, created_at, planner_engine,
+                budget_currency, budget_input_amount, budget_exchange_rate
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 plan["destination"], plan["duration"], plan["budget"], plan["travelers"],
                 plan["transport"], json.dumps(plan["interests"], ensure_ascii=False),
                 json.dumps(plan["budget_breakdown"], ensure_ascii=False),
                 json.dumps(_itinerary_for_storage(plan["itinerary"]), ensure_ascii=False), created_at, planner_engine,
+                str(plan.get("budget_currency") or "INR"),
+                float(plan.get("budget_input_amount") if plan.get("budget_input_amount") is not None else plan["budget"]),
+                plan.get("budget_exchange_rate"),
             ),
         )
         trip_id = int(cursor.lastrowid)
@@ -1247,6 +1477,185 @@ def _save_trip(plan: dict[str, Any]) -> dict[str, Any]:
         raise ApiProblem("The trip was generated but could not be retrieved after saving.", 500, "trip_save_failed")
     return _trip_from_row(row)
 
+
+
+def _exploration_route_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        data = json.loads(row["route_data"] or "{}")
+    except (ValueError, TypeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data["id"] = int(row["id"])
+    data["destination"] = str(row["destination"])
+    data["interests"] = json.loads(row["interests"] or "[]")
+    data["transport"] = str(row["transport"] or "Flexible")
+    data["created_at"] = str(row["created_at"]).replace(" ", "T", 1)
+    return data
+
+
+def _save_exploration_route(route_data: dict[str, Any]) -> dict[str, Any]:
+    created_at = datetime.now(timezone.utc).isoformat()
+    destination = str(route_data.get("destination") or "").strip()[:160]
+    interests = route_data.get("interests") if isinstance(route_data.get("interests"), list) else []
+    transport = str(route_data.get("transport") or "Flexible")
+    stored = dict(route_data)
+    stored["id"] = None
+    stored["created_at"] = created_at
+    with _database_connection() as connection:
+        cursor = connection.execute(
+            "INSERT INTO exploration_routes (destination, interests, transport, route_data, created_at) VALUES (?, ?, ?, ?, ?)",
+            (destination, json.dumps(interests, ensure_ascii=False), transport,
+             json.dumps(stored, ensure_ascii=False), created_at),
+        )
+        route_id = int(cursor.lastrowid)
+        stored["id"] = route_id
+        connection.execute("UPDATE exploration_routes SET route_data = ? WHERE id = ?", (json.dumps(stored, ensure_ascii=False), route_id))
+        row = connection.execute("SELECT * FROM exploration_routes WHERE id = ?", (route_id,)).fetchone()
+    if row is None:
+        raise ApiProblem("The exploration route was generated but could not be retrieved after saving.", 500, "exploration_route_save_failed")
+    return _exploration_route_from_row(row)
+
+
+def _validate_exploration_places(payload_places: object, center: dict[str, float]) -> list[dict[str, Any]]:
+    if not isinstance(payload_places, list):
+        raise ApiProblem("Select one or more places before generating a route.", 400, "exploration_places_required")
+    if not 1 <= len(payload_places) <= 8:
+        raise ApiProblem("Select between 1 and 8 places for an exploration route.", 400, "exploration_places_count_invalid")
+
+    places: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    seen_names: set[str] = set()
+    center_lat = float(center["latitude"])
+    center_lng = float(center["longitude"])
+    for raw in payload_places:
+        if not isinstance(raw, dict):
+            continue
+        name = re.sub(r"\s+", " ", str(raw.get("name") or "")).strip()[:160]
+        if not name:
+            continue
+        try:
+            lat = float(raw.get("latitude"))
+            lng = float(raw.get("longitude"))
+        except (TypeError, ValueError):
+            continue
+        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+            continue
+        distance = _distance_km(center_lat, center_lng, lat, lng)
+        if distance > 100:
+            continue
+        original_id = str(raw.get("id") or raw.get("place_id") or "").strip()
+        identity = original_id or hashlib.sha1(f"{_normal_name(name)}|{lat:.5f}|{lng:.5f}".encode("utf-8")).hexdigest()[:16]
+        normalized_name = _normal_name(name)
+        if identity in seen_ids or normalized_name in seen_names:
+            continue
+        seen_ids.add(identity)
+        seen_names.add(normalized_name)
+        map_url = str(raw.get("maps_url") or raw.get("map_url") or f"https://www.openstreetmap.org/?mlat={lat:.6f}&mlon={lng:.6f}#map=15/{lat:.6f}/{lng:.6f}")[:500]
+        try:
+            visit_minutes = max(30, min(180, int(raw.get("visit_duration_minutes", 60) or 60)))
+        except (TypeError, ValueError):
+            visit_minutes = 60
+        places.append({
+            "id": identity, "place_id": identity, "name": name,
+            "description": str(raw.get("description") or raw.get("recommendation_reason") or "A nearby place suggested for your selected interests.")[:450],
+            "recommendation_reason": str(raw.get("recommendation_reason") or raw.get("description") or "")[:450],
+            "category": str(raw.get("category") or "Point of interest")[:100],
+            "categories": raw.get("categories") if isinstance(raw.get("categories"), list) else [str(raw.get("category") or "Point of interest")],
+            "types": raw.get("types") if isinstance(raw.get("types"), list) else [str(raw.get("category") or "Point of interest")],
+            "address": str(raw.get("address") or "")[:300],
+            "latitude": lat, "longitude": lng,
+            "maps_url": map_url, "map_url": map_url,
+            "provider": str(raw.get("provider") or "Gemma recommendation; Geoapify geocoding; OpenStreetMap map")[:120],
+            "distance_from_destination_km": round(distance, 2),
+            "rating": raw.get("rating") if isinstance(raw.get("rating"), (int, float)) else None,
+            "visit_duration_minutes": visit_minutes,
+            "visit_duration_is_estimate": True,
+            "entry_fee_known": False, "estimated_entry_fee_per_person": 0,
+            "costs_are_estimates": True,
+            "planning_notes": str(raw.get("planning_notes") or "Verify current access, opening hours, activity availability and prices before visiting.")[:500],
+        })
+    if not places:
+        raise ApiProblem("None of the selected places could be validated within 100 km of this destination. Refresh the suggestions and try again.", 422, "no_valid_exploration_places")
+    return places
+
+
+def _build_exploration_route(
+    destination: str, interests: list[str], transport: str, places: list[dict[str, Any]],
+    resolved_destination: str, center: dict[str, float],
+) -> dict[str, Any]:
+    """Optimize selected extra places from the destination center and attach road geometry."""
+    origin = {
+        "id": "__exploration_destination_origin__",
+        "place_id": "__exploration_destination_origin__",
+        "name": f"Start · {resolved_destination}",
+        "latitude": float(center["latitude"]),
+        "longitude": float(center["longitude"]),
+    }
+    matrix_places = [origin, *places]
+    matrix, route_source = _compute_route_matrix(matrix_places, transport)
+    ordered_places = _optimize_activity_order_from_origin(places, matrix, str(origin["id"]))
+    activities: list[dict[str, Any]] = []
+    for stop_index, place in enumerate(ordered_places, start=1):
+        activities.append({
+            "attraction_id": str(place["id"]), "place_id": str(place["id"]),
+            "name": str(place["name"]),
+            "description": str(place.get("description") or place.get("recommendation_reason") or "Suggested for your selected interests."),
+            "category": str(place.get("category") or "Point of interest"),
+            "estimated_cost": 0, "estimated_entry_fee_per_person": 0,
+            "entry_fee_known": False,
+            "visit_duration_minutes": max(30, min(180, int(place.get("visit_duration_minutes", 60) or 60))),
+            "visit_duration_is_estimate": True,
+            "planning_notes": str(place.get("planning_notes") or "Verify access, opening hours and prices before travelling."),
+            "address": str(place.get("address") or ""),
+            "latitude": float(place["latitude"]), "longitude": float(place["longitude"]),
+            "rating": place.get("rating"),
+            "maps_url": place.get("maps_url") or place.get("map_url"),
+            "provider": str(place.get("provider") or "Gemma recommendation"),
+            "costs_are_estimates": True,
+            "recommendation_reason": str(place.get("recommendation_reason") or place.get("description") or ""),
+        })
+
+    origin_id = str(origin["id"])
+    travel_minutes = _matrix_minutes(matrix, origin_id, str(activities[0]["place_id"])) if activities else 0
+    travel_distance = float(matrix.get(origin_id, {}).get(str(activities[0]["place_id"]), {}).get("distance_km", 0)) if activities else 0.0
+    for prev, nxt in zip(activities, activities[1:]):
+        travel_minutes += _matrix_minutes(matrix, str(prev["place_id"]), str(nxt["place_id"]))
+        travel_distance += float(matrix.get(str(prev["place_id"]), {}).get(str(nxt["place_id"]), {}).get("distance_km", 0))
+
+    day: dict[str, Any] = {
+        "day": 1, "theme": "Other places to explore", "activities": activities,
+        "note": "Optional places only. Your original itinerary was not changed.",
+        "travel_minutes_estimate": travel_minutes,
+        "travel_distance_km_estimate": round(travel_distance, 1),
+        "route_time_source": route_source,
+        "route_path": [], "route_path_source": "pending route geometry",
+    }
+    places_by_id = {str(place["id"]): place for place in places}
+    _attach_open_route_paths(
+        [day], {"transport": transport}, places_by_id, center, always_start_from_center=True
+    )
+    # Ensure the metadata stays useful when road geometry is unavailable.
+    if day.get("route_path_source", "").lower().find("straight-line") >= 0:
+        day["travel_minutes_estimate"] = max(1, int(travel_minutes))
+        day["travel_distance_km_estimate"] = round(travel_distance, 1)
+
+    return {
+        "id": None,
+        "title": f"Exploration route near {resolved_destination}",
+        "destination": destination,
+        "resolved_destination": resolved_destination,
+        "interests": interests,
+        "transport": transport,
+        "radius_km": 100,
+        "places": activities,
+        "route_path": day.get("route_path") or [],
+        "route_path_source": day.get("route_path_source") or route_source,
+        "travel_minutes_estimate": int(day.get("travel_minutes_estimate") or travel_minutes),
+        "travel_distance_km_estimate": float(day.get("travel_distance_km_estimate") or round(travel_distance, 1)),
+        "route_time_source": route_source,
+        "note": day["note"],
+    }
 
 def create_app(config_overrides: dict[str, Any] | None = None) -> Flask:
     app = Flask(__name__)
@@ -1311,6 +1720,16 @@ def create_app(config_overrides: dict[str, Any] | None = None) -> Flask:
             current_app.logger.exception("SQLite health check failed")
             return jsonify({"status": "error", "service": "RoamWise API", "database": "unavailable"}), 503
 
+    @app.get("/api/exchange-rate")
+    def exchange_rate():
+        rate_info = _get_usd_inr_rate()
+        return jsonify({
+            "base_currency": "USD", "target_currency": "INR",
+            "rate": rate_info["rate"], "updated_at": rate_info.get("updated_at"),
+            "source": rate_info.get("source"),
+            "attribution_url": "https://www.exchangerate-api.com/docs/free",
+        })
+
     @app.get("/api/destinations")
     def list_explore_destinations():
         # A curated set for the Explore page only; the planner accepts free text.
@@ -1361,31 +1780,166 @@ def create_app(config_overrides: dict[str, Any] | None = None) -> Flask:
             raise ApiProblem("Request body contains invalid JSON.", 400, "invalid_json")
 
         plan_request = _validate_plan(payload)
+        if plan_request["budget_currency"] == "USD":
+            fx = _get_usd_inr_rate()
+            normalized_budget = int(round(plan_request["budget_input_amount"] * float(fx["rate"])))
+            if not 500 <= normalized_budget <= MAX_BUDGET_INR:
+                raise ApiProblem(
+                    f"That USD budget converts to approximately ₹{normalized_budget:,}. Choose an amount that converts to ₹500–₹{MAX_BUDGET_INR:,}.",
+                    400, "budget_out_of_range",
+                )
+            plan_request["budget"] = normalized_budget
+            plan_request["budget_exchange_rate"] = float(fx["rate"])
+            plan_request["budget_exchange_rate_updated_at"] = fx.get("updated_at")
+        else:
+            plan_request["budget"] = int(round(plan_request["budget_input_amount"]))
+            plan_request["budget_exchange_rate"] = None
+            plan_request["budget_exchange_rate_updated_at"] = None
         _require_env("GEMMA_API_KEY", "recommend real visitor places and optimize the itinerary")
         _require_env("GEOAPIFY_API_KEY", "resolve the destination and suggested places to coordinates")
 
         # Gemma chooses attractions/activity areas. Geoapify only resolves those names to map coordinates.
         all_places, resolved_destination, center = _discover_gemma_places(plan_request)
-        # Do not fail the whole trip just because the geocoder verified fewer than
-        # three suggestions. The itinerary builder can use one verified stop and
-        # explicitly mark any remaining days as under-filled instead of returning 422.
+        # The broader Gemma fallback has already tried to supplement sparse results.
+        # Keep any remaining verified stops instead of failing solely on a low count.
 
         candidates = _rank_places(all_places, plan_request["interests"])[:MAX_CANDIDATES_FOR_ROUTING]
         route_matrix, route_source = _compute_route_matrix(candidates, plan_request["transport"])
         itinerary = _generate_gemma_itinerary(plan_request, candidates, resolved_destination, route_matrix, route_source)
         by_id = {str(place["id"]): place for place in candidates}
-        _attach_open_route_paths(itinerary, plan_request, by_id)
-        breakdown = _estimate_budget(plan_request, itinerary)
+        _attach_open_route_paths(itinerary, plan_request, by_id, center)
+        # Do not fabricate transport, lodging, food, or miscellaneous cost estimates.
+        # Keep the submitted budget as planner context, but persist an empty legacy
+        # breakdown object for compatibility with existing SQLite databases.
         plan = {
             **plan_request,
             "itinerary": itinerary,
-            "budget_breakdown": breakdown,
+            "budget_breakdown": {},
             "planner_engine": f"Gemma ({os.getenv('GEMMA_MODEL', 'gemma-4-31b-it')}) recommendations + Geoapify geocoding + OpenStreetMap OSRM + open route optimization ({route_source})",
         }
         trip = _save_trip(plan)
         trip["itinerary"] = itinerary
         return jsonify({"trip": trip}), 201
 
+
+    @app.post("/api/explore/places")
+    def discover_other_places():
+        """Return optional Gemma-recommended attractions within 100 km, separate from the core itinerary."""
+        if not request.is_json:
+            raise ApiProblem("Request must contain a JSON object.", 400, "invalid_json")
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            raise ApiProblem("Request body must be a JSON object.", 400, "invalid_json")
+        destination = str(payload.get("destination") or "").strip()
+        if not destination or len(destination) > 120:
+            raise ApiProblem("A destination of 1–120 characters is required.", 400, "destination_required")
+        interests = payload.get("interests", [])
+        if not isinstance(interests, list) or len(interests) > 8 or any(not isinstance(x, str) or not x.strip() for x in interests):
+            raise ApiProblem("Interests must be an array of up to 8 non-empty strings.", 400, "invalid_interests")
+        interests = list(dict.fromkeys(str(x).strip()[:60] for x in interests)) or ["Popular / hot"]
+        transport = str(payload.get("transport") or "Flexible")
+        if transport not in SUPPORTED_TRANSPORT:
+            transport = "Flexible"
+        exclude_names = payload.get("exclude_names", [])
+        if not isinstance(exclude_names, list):
+            exclude_names = []
+        exclude_names = [str(name).strip()[:160] for name in exclude_names[:80] if isinstance(name, str) and name.strip()]
+        excluded_normalized = {_normal_name(name) for name in exclude_names}
+        api_key = _geoapify_key()
+        latitude, longitude, resolved_destination = _geocode_destination(destination, api_key)
+        explore_plan = {
+            "destination": destination, "duration": 1, "budget": 0, "budget_input_amount": 0,
+            "budget_currency": "INR", "travelers": 1, "transport": transport, "interests": interests,
+        }
+        recommendations = _generate_gemma_place_recommendations(
+            explore_plan, resolved_destination, broaden_to_popular=True, exclude_names=exclude_names,
+        )
+        # Keep the candidate pool separate from the saved/active trip, while avoiding visible repeats.
+        recommendations = [item for item in recommendations if _normal_name(item.get("name", "")) not in excluded_normalized]
+
+        # This well-established regional attraction is often omitted by generic model prompts.
+        # For the Hirakud/Sambalpur/Burla area, explicitly attempt to resolve it even if Gemma
+        # omitted it; it is only displayed if Geoapify confirms a matching location inside 100 km.
+        destination_context = f"{destination} {resolved_destination}".casefold()
+        in_hirakud_region = any(term in destination_context for term in ("hirakud", "sambalpur", "burla"))
+        debrigarh_name = "Debrigarh Wildlife Sanctuary"
+        if in_hirakud_region and _normal_name(debrigarh_name) not in excluded_normalized and not any(
+            _normal_name(item.get("name", "")) == _normal_name(debrigarh_name)
+            for item in recommendations
+        ):
+            recommendations.insert(0, {
+                "name": debrigarh_name,
+                "category": "Wildlife Sanctuary",
+                "reason": "Wildlife sanctuary on the Hirakud Reservoir, suited to wildlife, birding and nature interests; confirm visitor access before travelling.",
+                "area": "Hirakud Reservoir, Odisha",
+            })
+        by_id: dict[str, dict[str, Any]] = {}
+        unmapped, geocoding_failures = _resolve_gemma_recommendations(
+            recommendations, explore_plan, resolved_destination, latitude, longitude,
+            api_key, by_id, radius_km=100,
+        )
+        places = [place for place in _rank_places(list(by_id.values()), interests)
+                  if _normal_name(str(place.get("name") or "")) not in excluded_normalized]
+        # A 100 km circle makes nearby wildlife/ecotourism options visible for sparse locations,
+        # while geocoding and country/radius checks still prevent distant false matches.
+        current_app.logger.info(
+            "Other-places discovery resolved %d places within 100 km of %r; unmapped=%d temporary geocoding failures=%d.",
+            len(places), resolved_destination, len(unmapped), geocoding_failures,
+        )
+        return jsonify({
+            "destination": destination, "resolved_destination": resolved_destination,
+            "radius_km": 100, "places": places[:24], "count": min(len(places), 24),
+            "unmapped_count": len(unmapped),
+            "note": "Optional extra places. They do not change the itinerary until you select them and generate a separate route.",
+        })
+
+    @app.post("/api/explore/route")
+    def generate_exploration_route():
+        """Optimize and separately save a route from the destination center through user-selected extra places."""
+        if not request.is_json:
+            raise ApiProblem("Request must contain a JSON object.", 400, "invalid_json")
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            raise ApiProblem("Request body must be a JSON object.", 400, "invalid_json")
+        destination = str(payload.get("destination") or "").strip()
+        if not destination or len(destination) > 120:
+            raise ApiProblem("A destination of 1–120 characters is required.", 400, "destination_required")
+        interests = payload.get("interests", [])
+        if not isinstance(interests, list) or len(interests) > 8 or any(not isinstance(x, str) or not x.strip() for x in interests):
+            raise ApiProblem("Interests must be an array of up to 8 non-empty strings.", 400, "invalid_interests")
+        interests = list(dict.fromkeys(str(x).strip()[:60] for x in interests))
+        transport = str(payload.get("transport") or "Flexible")
+        if transport not in SUPPORTED_TRANSPORT:
+            raise ApiProblem(f"Transport must be one of: {', '.join(sorted(SUPPORTED_TRANSPORT))}.", 400, "invalid_transport")
+        api_key = _geoapify_key()
+        latitude, longitude, resolved_destination = _geocode_destination(destination, api_key)
+        center = {"latitude": latitude, "longitude": longitude}
+        places = _validate_exploration_places(payload.get("places"), center)
+        route_data = _build_exploration_route(destination, interests, transport, places, resolved_destination, center)
+        saved = _save_exploration_route(route_data)
+        return jsonify({"route": saved, "message": "Optimized exploration route generated and saved separately from the trip itinerary."}), 201
+
+    @app.get("/api/exploration-routes")
+    def list_saved_exploration_routes():
+        try:
+            requested_limit = int(request.args.get("limit", 10))
+        except ValueError:
+            requested_limit = 10
+        limit = max(1, min(requested_limit, 50))
+        with _database_connection() as connection:
+            total = int(connection.execute("SELECT COUNT(*) FROM exploration_routes").fetchone()[0])
+            rows = connection.execute(
+                "SELECT * FROM exploration_routes ORDER BY created_at DESC, id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return jsonify({"routes": [_exploration_route_from_row(row) for row in rows], "count": total})
+
+    @app.delete("/api/exploration-routes/<int:route_id>")
+    def delete_saved_exploration_route(route_id: int):
+        with _database_connection() as connection:
+            cursor = connection.execute("DELETE FROM exploration_routes WHERE id = ?", (route_id,))
+        if cursor.rowcount == 0:
+            raise ApiProblem("Saved exploration route not found.", 404, "not_found")
+        return jsonify({"message": "Saved exploration route deleted.", "id": route_id})
 
     @app.get("/api/trips")
     def list_saved_trips():
