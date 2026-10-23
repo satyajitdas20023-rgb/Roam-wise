@@ -8,6 +8,7 @@ import {
   Check,
   Compass,
   MapPin,
+  LoaderCircle,
   Search,
   Sparkles,
   Users,
@@ -59,7 +60,7 @@ type Activity = {
   costs_are_estimates?: boolean
 }
 
-type ItineraryDay = { day: number; activities: Activity[]; note?: string; theme?: string }
+type ItineraryDay = { day: number; activities: Activity[]; note?: string; theme?: string; route_path?: Array<{ latitude: number; longitude: number }>; travel_minutes_estimate?: number; travel_distance_km_estimate?: number; route_time_source?: string }
 
 type BudgetBreakdown = {
   currency: 'INR'
@@ -351,6 +352,19 @@ function ItineraryMap({ destination, itinerary }: { destination: string; itinera
         for (const [day, dayStops] of byDay) {
           if (cancelled) return
           if (dayStops.length < 2) continue
+
+          // Prefer the path already calculated by the Flask/OSRM backend. If it is
+          // unavailable, preserve the previously working browser-side OSRM fallback.
+          const backendPath = itinerary.find((item) => item.day === day)?.route_path ?? []
+          const backendLatLngs = backendPath
+            .map((point) => [Number(point.latitude), Number(point.longitude)] as LatLngTuple)
+            .filter(([lat, lng]) => Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180)
+          if (backendLatLngs.length >= 2 && map) {
+            L.polyline(backendLatLngs, { color: MAP_DAY_COLORS[(day - 1) % MAP_DAY_COLORS.length], weight: 5, opacity: 0.92, lineCap: 'round', lineJoin: 'round' }).addTo(map)
+            routesLoaded += 1
+            continue
+          }
+
           const coordinateString = dayStops.map(stop => `${stop.position[1]},${stop.position[0]}`).join(';')
           try {
             const response = await fetch(`https://router.project-osrm.org/route/v1/driving/${coordinateString}?overview=full&geometries=geojson&steps=false`, { signal: AbortSignal.timeout(12000) })
@@ -380,7 +394,7 @@ function ItineraryMap({ destination, itinerary }: { destination: string; itinera
       cancelled = true
       map?.remove()
     }
-  }, [stops])
+  }, [stops, itinerary])
 
   if (stops.length === 0 || mapError) {
     return (
@@ -463,7 +477,7 @@ const fallbackDestinations: DestinationCard[] = [
   },
 ]
 
-const interestOptions = ['Nature', 'History', 'Temples', 'Beaches', 'Local food', 'Adventure', 'Photography', 'Hidden gems']
+const interestOptions = ['Nature', 'History', 'Local food', 'Adventure', 'Photography', 'Popular / hot']
 
 const fieldClass = 'w-full rounded-xl border border-[#2B4A60] bg-[#091B2A] px-4 py-3 text-[#ECF5FC] outline-none transition placeholder:text-[#7E98AA] focus:border-[#57DCC6] focus:ring-2 focus:ring-[#57DCC6]/15'
 const fieldLabelClass = 'block text-sm font-semibold text-[#D9E7F1]'
@@ -767,6 +781,13 @@ export default function Home() {
     )
   }
 
+  const allInterestsSelected = interestOptions.every((interest) => interests.includes(interest))
+
+  const toggleAllInterests = () => {
+    setInterests(allInterestsSelected ? [] : [...interestOptions])
+    clearPlanResult()
+  }
+
   const generateItinerary = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const parsedDuration = Number(duration)
@@ -811,7 +832,7 @@ export default function Home() {
       setBudget(String(savedTrip.budget))
       setTravelers(String(savedTrip.travelers))
       setTransport(savedTrip.transport)
-      setInterests(savedTrip.interests)
+      setInterests(savedTrip.interests.filter((interest) => interestOptions.includes(interest)))
     } catch (error) {
       setPlanError(error instanceof Error ? error.message : 'That saved trip could not be opened.')
     } finally {
@@ -931,7 +952,7 @@ export default function Home() {
                   <Sparkles size={23} />
                 </span>
                 <span className="flex-1">
-                <span className="flex flex-wrap items-center gap-2 text-lg font-bold text-white">Plan a trip <span className="rounded-full border border-[#73E4D2]/25 bg-[#58D9C2]/10 px-2 py-0.5 text-[9px] font-bold uppercase tracking-[0.12em] text-[#87EBDC]">Demo planner</span></span>
+                <span className="flex flex-wrap items-center gap-2 text-lg font-bold text-white">Plan a trip <span className="rounded-full border border-[#73E4D2]/25 bg-[#58D9C2]/10 px-2 py-0.5 text-[9px] font-bold uppercase tracking-[0.12em] text-[#87EBDC]">Gemma + open routes</span></span>
                   <span className="mt-1 block text-sm leading-5 text-[#B6CFDD]">Build an itinerary around your budget, time and interests.</span>
                 </span>
                 <ArrowRight size={19} className="shrink-0 text-[#83A5B8] transition duration-300 ease-out group-hover:translate-x-1.5 group-hover:text-[#70E6D2]" />
@@ -1002,7 +1023,7 @@ export default function Home() {
             </div>
           ) : (
             <div className="mt-12 rounded-2xl border border-dashed border-[#35566A] bg-[#0C2232]/60 p-10 text-center text-sm text-[#A8BECE]">
-              <p>No curated Explore cards match “{search}”. You can still plan any destination using live place search.</p>
+              <p>No curated Explore cards match “{search}”. You can still plan any destination with Gemma's recommendations.</p>
               <button type="button" onClick={() => openPlanner(search.trim())} className="mt-4 inline-flex items-center gap-2 rounded-full border border-[#57DCC6]/30 bg-[#123B45] px-4 py-2.5 text-sm font-semibold text-[#83EAD9] transition hover:bg-[#174A55]">
                 Plan {search.trim() ? `a trip to ${search.trim()}` : 'a trip'} <ArrowRight size={15} />
               </button>
@@ -1019,7 +1040,7 @@ export default function Home() {
           <div className="mt-6 rounded-2xl border border-[#29485C] bg-gradient-to-br from-[#0F2A3C] via-[#0B2030] to-[#0A1C2A] p-5 sm:p-7">
             <p className="inline-flex items-center gap-2 text-xs font-bold uppercase tracking-[0.16em] text-[#78E7D4]"><Sparkles size={14} /> Gemma-powered trip planner</p>
             <h1 className="mt-3 text-3xl font-extrabold tracking-tight text-white sm:text-4xl">Make a plan that fits you.</h1>
-            <p className="mt-2 max-w-2xl text-sm leading-6 text-[#B4C7D6] sm:text-base">Tell us what your trip should look like. RoamWise discovers real place listings, then hosted Gemma selects and organizes them into a personalized day-by-day itinerary.</p>
+            <p className="mt-2 max-w-2xl text-sm leading-6 text-[#B4C7D6] sm:text-base">Tell us what your trip should look like. Hosted Gemma recommends the places; Geoapify resolves their coordinates, and open routing tools optimize the day-by-day route.</p>
           </div>
 
           <form onSubmit={generateItinerary} className="mt-5 rounded-2xl border border-[#29485C] bg-[#0B2030] p-5 shadow-[0_18px_50px_rgba(0,0,0,0.16)] sm:p-7">
@@ -1173,10 +1194,23 @@ export default function Home() {
             </div>
 
             <fieldset className="mt-6">
-              <legend className="text-sm font-semibold text-[#D9E7F1]">What are you interested in?</legend>
+              <legend className="sr-only">What are you interested in?</legend>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <p className="text-sm font-semibold text-[#D9E7F1]">What are you interested in?</p>
+                <button
+                  type="button"
+                  onClick={toggleAllInterests}
+                  aria-pressed={allInterestsSelected}
+                  className="rounded-full border border-[#57DCC6]/35 bg-[#0D2A37] px-3 py-1.5 text-xs font-bold text-[#8AECDD] transition hover:border-[#57DCC6]/70 hover:bg-[#123D43]"
+                >
+                  {allInterestsSelected ? 'Clear all' : 'Select all'}
+                </button>
+              </div>
+              <p className="mt-1.5 text-xs text-[#819BAD]">Choose a few interests or select all. “Popular / hot” favors well-known must-visit places; it is not a live trend feed.</p>
               <div className="mt-3 flex flex-wrap gap-2">
                 {interestOptions.map((interest) => {
                   const selected = interests.includes(interest)
+                  const isPopular = interest === 'Popular / hot'
                   return (
                     <button
                       key={interest}
@@ -1185,7 +1219,7 @@ export default function Home() {
                       onClick={() => { toggleInterest(interest); clearPlanResult() }}
                       className={`inline-flex items-center gap-1.5 rounded-full border px-3.5 py-2 text-sm transition ${selected ? 'border-[#57DCC6]/60 bg-[#123D43] font-semibold text-[#8AECDD]' : 'border-[#2B4A60] bg-[#091B2A] text-[#B1C4D2] hover:border-[#57DCC6]/45 hover:text-white'}`}
                     >
-                      {selected && <Check size={14} />} {interest}
+                      {selected && <Check size={14} />}{isPopular ? '🔥 ' : ''}{interest}
                     </button>
                   )
                 })}
@@ -1197,10 +1231,20 @@ export default function Home() {
                 {planError}
               </div>
             )}
-            <button disabled={isGenerating} type="submit" className="mt-7 inline-flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-[#25BCA5] to-[#379CC4] px-5 py-3.5 font-bold text-[#041923] shadow-[0_8px_24px_rgba(37,188,165,0.16)] transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60 sm:w-auto">
-              <Sparkles size={17} /> {isGenerating ? 'Generating itinerary…' : 'Generate itinerary'} <ArrowRight size={17} />
-            </button>
-            <p className="mt-3 text-xs leading-5 text-[#819BAD]">Places are discovered dynamically from Geoapify using OpenStreetMap data; hosted Gemma selects and organizes the itinerary. Costs are illustrative estimates, not live quotes or bookings.</p>
+            <div className="mt-7 flex flex-wrap items-center gap-3">
+              <button disabled={isGenerating} type="submit" className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-[#25BCA5] to-[#379CC4] px-5 py-3.5 font-bold text-[#041923] shadow-[0_8px_24px_rgba(37,188,165,0.16)] transition hover:brightness-110 disabled:cursor-wait disabled:opacity-80 sm:w-auto">
+                {isGenerating ? <LoaderCircle size={17} className="animate-spin" aria-hidden="true" /> : <Sparkles size={17} aria-hidden="true" />}
+                {isGenerating ? 'Generating itinerary…' : 'Generate itinerary'}
+                {!isGenerating && <ArrowRight size={17} aria-hidden="true" />}
+              </button>
+              {isGenerating && (
+                <p role="status" aria-live="polite" className="inline-flex items-center gap-2 text-xs leading-5 text-[#9EB7C7]">
+                  <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-[#57DCC6]" aria-hidden="true" />
+                  Finding places and optimizing your route. You can keep using RoamWise.
+                </p>
+              )}
+            </div>
+            <p className="mt-3 text-xs leading-5 text-[#819BAD]">Hosted Gemma recommends the places; Geoapify is used to resolve destinations and place coordinates. OpenStreetMap-based routing is best-effort. Costs are illustrative estimates, not live quotes or bookings.</p>
           </form>
 
           {trip && (

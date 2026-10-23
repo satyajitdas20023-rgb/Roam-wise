@@ -1,12 +1,15 @@
 """RoamWise Flask API in one file.
 
-Geoapify discovers real OpenStreetMap-based points of interest; hosted Gemma selects and
-organizes them into a personalized itinerary. SQLite is used only for saved-trip persistence.
+Gemma generates targeted search queries and plans an itinerary from Gemma recommendation candidates.
+OpenStreetMap OSRM supplies route-time estimates and map route geometry. SQLite persists saved trips.
 """
 from __future__ import annotations
 
 import json
+import math
 import logging
+import hashlib
+import threading
 from contextlib import contextmanager
 import os
 import re
@@ -27,13 +30,17 @@ from werkzeug.exceptions import HTTPException
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 GEOAPIFY_GEOCODE_URL = "https://api.geoapify.com/v1/geocode/search"
-GEOAPIFY_AUTOCOMPLETE_URL = "https://api.geoapify.com/v1/geocode/autocomplete"
-GEOAPIFY_PLACES_URL = "https://api.geoapify.com/v2/places"
-_PLACE_CACHE: dict[str, tuple[float, tuple[str, str, list[dict[str, Any]]]]] = {}
-_PLACE_CACHE_TTL_SECONDS = 15 * 60
-MIN_VERIFIED_SIGHT_COUNT = 3
+# Public OpenStreetMap-based OSRM instances. They may throttle or be unavailable;
+# the planner labels and falls back to approximate times rather than pretending otherwise.
+OSRM_CAR_BASE = os.getenv("ROAMWISE_OSRM_CAR_BASE", "https://routing.openstreetmap.de/routed-car")
+OSRM_FOOT_BASE = os.getenv("ROAMWISE_OSRM_FOOT_BASE", "https://routing.openstreetmap.de/routed-foot")
+MAX_CANDIDATES_FOR_ROUTING = 12
 SUPPORTED_TRANSPORT = {"Flexible", "Public transport", "Walking", "Cab", "Rental vehicle"}
 MAX_BUDGET_INR = 100_000
+
+# Respect the shared FOSSGIS OSRM demo limit (about one request per second).
+_OSRM_REQUEST_LOCK = threading.Lock()
+_OSRM_LAST_REQUEST_FINISHED = 0.0
 
 # These are Explore-page starter cards only. They are NOT an allowlist and are
 # never used to generate itineraries; users can plan any destination.
@@ -90,6 +97,7 @@ INTEREST_TERMS: dict[str, tuple[str, ...]] = {
     "local food": ("food", "restaurant", "market", "cafe", "café", "bakery", "street food", "food court"),
     "adventure": ("adventure", "hiking", "climbing", "rafting", "outdoor", "ski", "trail", "amusement"),
     "photography": ("viewpoint", "scenic", "lookout", "landmark", "garden", "skyline", "waterfront"),
+    "popular / hot": ("popular", "famous", "iconic", "well known", "well-known", "must-see", "must see", "top attraction", "hotspot", "hot spot"),
     "hidden gems": ("local", "village", "craft", "neighbourhood", "neighborhood", "market", "art district"),
 }
 
@@ -241,230 +249,812 @@ def _service_headers() -> dict[str, str]:
     return {"User-Agent": identity, "Accept": "application/json"}
 
 
-def _provider_error(response: requests.Response, provider: str) -> ApiProblem:
-    if response.status_code in (401, 403):
-        current_app.logger.warning("%s rejected the configured API key (HTTP %s).", provider, response.status_code)
-        return ApiProblem(
-            f"{provider} rejected its API key. Check the key in backend/.env and confirm the API is enabled.",
-            503,
-            f"{provider.lower().replace(' ', '_')}_authentication_error",
-        )
-    if response.status_code == 429:
-        return ApiProblem(f"{provider} rate limit reached. Wait a moment and retry.", 503, "places_rate_limited")
-    current_app.logger.warning("%s returned HTTP %s.", provider, response.status_code)
-    return ApiProblem(f"{provider} is temporarily unavailable. Please retry shortly.", 503, "places_provider_unavailable")
 
 
-def _geoapify_geocode(destination: str, api_key: str) -> tuple[float, float, str]:
-    try:
-        response = requests.get(
-            GEOAPIFY_GEOCODE_URL,
-            params={"text": destination, "format": "json", "limit": 1, "lang": "en", "apiKey": api_key},
-            headers=_service_headers(),
-            timeout=(5, 15),
-        )
-    except requests.RequestException as error:
-        current_app.logger.warning("Geoapify geocoding failed (%s).", type(error).__name__)
-        raise ApiProblem("The place-data service could not be reached. Check your internet connection and try again.", 503, "geocoding_network_error") from error
-
-    if not response.ok:
-        raise _provider_error(response, "Geoapify geocoding")
-    try:
-        payload = response.json()
-    except ValueError as error:
-        raise ApiProblem("The place-data service returned an unreadable geocoding response.", 502, "geocoding_invalid_response") from error
-
-    results = payload.get("results", []) if isinstance(payload, dict) else []
-    if not isinstance(results, list) or not results:
-        raise ApiProblem(
-            f"We couldn't identify '{destination}'. Try adding its state or country.",
-            422,
-            "destination_not_found",
-        )
-    try:
-        lat = float(results[0]["lat"])
-        lon = float(results[0]["lon"])
-    except (KeyError, TypeError, ValueError, IndexError) as error:
-        raise ApiProblem("The place-data service could not resolve coordinates for that destination.", 422, "destination_coordinates_missing") from error
-    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-        raise ApiProblem("The place-data service returned invalid coordinates for that destination.", 502, "destination_coordinates_invalid")
-    formatted = str(results[0].get("formatted") or destination).strip()
-    return lat, lon, formatted
+def _geoapify_key() -> str:
+    return _require_env("GEOAPIFY_API_KEY", "resolve the destination and Gemma-recommended place coordinates")
 
 
-BASE_PLACE_CATEGORIES = [
-    "tourism",
-    "tourism.sights",
-    "tourism.attraction",
-    "entertainment.museum",
-    "entertainment.culture",
-    "heritage",
-    "leisure.park",
-    "natural",
-    "national_park",
-    "beach",
-    "religion.place_of_worship",
-]
-
-INTEREST_CATEGORIES: dict[str, list[str]] = {
-    "nature": ["natural", "leisure.park", "national_park"],
-    "history": ["heritage", "tourism.sights", "entertainment.museum"],
-    "temples": ["religion.place_of_worship", "tourism.sights.place_of_worship"],
-    "beaches": ["beach", "natural.coastal"],
-    "local food": ["catering.restaurant", "catering.cafe", "catering.food_court"],
-    "adventure": ["activity", "sport", "natural", "tourism.attraction"],
-    "photography": ["tourism.attraction.viewpoint", "tourism.sights", "natural", "leisure.park"],
-    "hidden gems": ["tourism", "entertainment.culture", "heritage", "leisure.park"],
-}
-
-SIGHT_CATEGORY_PREFIXES = (
-    "tourism", "entertainment", "heritage", "leisure", "natural", "national_park",
-    "beach", "religion", "historic", "museum",
-)
-
-
-def _get_place_categories(interests: list[str]) -> list[str]:
-    categories = list(BASE_PLACE_CATEGORIES)
-    for interest in interests:
-        categories.extend(INTEREST_CATEGORIES.get(interest.casefold(), []))
-    # Keep the request compact and don't include unsupported or unrelated category names.
-    return list(dict.fromkeys(categories))[:25]
-
-
-def _human_category(categories: list[str]) -> str:
-    if not categories:
-        return "Point of interest"
-    preferred_prefixes = ("tourism.sights", "tourism.attraction", "heritage", "entertainment.museum", "leisure.park", "natural", "beach", "religion")
-    chosen = next((item for prefix in preferred_prefixes for item in categories if item == prefix or item.startswith(prefix + ".")), categories[0])
-    return chosen.replace(".", " · ").replace("_", " ").title()
-
-
-def _discover_geoapify_places(destination: str, lat: float, lon: float, interests: list[str], api_key: str) -> list[dict[str, Any]]:
-    categories = _get_place_categories(interests)
-    try:
-        response = requests.get(
-            GEOAPIFY_PLACES_URL,
-            params={
-                "categories": ",".join(categories),
-                "filter": f"circle:{lon:.6f},{lat:.6f},20000",
-                "bias": f"proximity:{lon:.6f},{lat:.6f}",
-                "limit": 100,
-                "lang": "en",
-                "apiKey": api_key,
-            },
-            headers=_service_headers(),
-            timeout=(5, 20),
-        )
-    except requests.RequestException as error:
-        current_app.logger.warning("Geoapify place search failed (%s).", type(error).__name__)
-        raise ApiProblem("Place search is temporarily unavailable. Please retry in a moment.", 503, "places_network_error") from error
-
-    if not response.ok:
-        raise _provider_error(response, "Geoapify Places")
-    try:
-        payload = response.json()
-    except ValueError as error:
-        raise ApiProblem("The place-data service returned an unreadable places response.", 502, "places_invalid_response") from error
-
-    features = payload.get("features", []) if isinstance(payload, dict) else []
-    if not isinstance(features, list):
-        raise ApiProblem("The place-data service returned an unexpected places response.", 502, "places_invalid_response")
-
-    places: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for feature in features:
-        if not isinstance(feature, dict):
-            continue
-        props = feature.get("properties") or {}
-        if not isinstance(props, dict):
-            continue
-        name = str(props.get("name") or props.get("address_line1") or "").strip()
-        if not name or name.casefold() in {destination.casefold(), "unnamed"}:
-            continue
-        geometry = feature.get("geometry")
-        coordinates = geometry.get("coordinates") if isinstance(geometry, dict) else None
-        raw_lat = props.get("lat")
-        raw_lon = props.get("lon")
-        if (raw_lat is None or raw_lon is None) and isinstance(coordinates, (list, tuple)) and len(coordinates) >= 2:
-            raw_lon = coordinates[0] if raw_lon is None else raw_lon
-            raw_lat = coordinates[1] if raw_lat is None else raw_lat
+def _geoapify_geocode(text: str, api_key: str, center: tuple[float, float] | None = None,
+                      radius_km: float | None = None, limit: int = 5) -> list[dict[str, Any]]:
+    """Geocode text only; Geoapify is not used to choose or recommend attractions."""
+    params: dict[str, Any] = {"text": text, "format": "json", "apiKey": api_key, "limit": limit, "lang": "en"}
+    if center:
+        lat, lng = center
+        params["bias"] = f"proximity:{lng},{lat}"
+        if radius_km:
+            params["filter"] = f"circle:{lng},{lat},{int(radius_km * 1000)}"
+    response = None
+    last_network_error: Exception | None = None
+    for attempt in range(2):
         try:
-            place_lat = float(raw_lat)
-            place_lon = float(raw_lon)
-        except (TypeError, ValueError):
-            continue
-        if not (-90 <= place_lat <= 90 and -180 <= place_lon <= 180):
-            continue
-        raw_id = str(props.get("place_id") or f"{name.casefold()}:{place_lat:.5f}:{place_lon:.5f}")
-        if raw_id in seen:
-            continue
-        seen.add(raw_id)
-        raw_categories = props.get("categories") or []
-        if not isinstance(raw_categories, list):
-            raw_categories = []
-        clean_categories = [str(category) for category in raw_categories[:12]]
-        osm_url = f"https://www.openstreetmap.org/?mlat={place_lat:.6f}&mlon={place_lon:.6f}#map=16/{place_lat:.6f}/{place_lon:.6f}"
-        places.append({
-            "id": raw_id,
-            "name": name,
-            "description": "",
-            "category": _human_category(clean_categories),
-            "categories": clean_categories,
-            "address": str(props.get("formatted") or "").strip(),
-            "latitude": place_lat,
-            "longitude": place_lon,
-            "rating": None,
-            "maps_url": osm_url,
-            "map_url": osm_url,
-            "provider": "Geoapify / OpenStreetMap",
-            "entry_fee_known": False,
-            "estimated_entry_fee_per_person": 0,
-            "visit_duration_minutes": 90,
-            "visit_duration_is_estimate": True,
-            "costs_are_estimates": True,
-            "planning_notes": "Opening hours, access rules, and ticket prices are not verified by this place search; check before travelling.",
-        })
+            response = requests.get(GEOAPIFY_GEOCODE_URL, params=params, headers=_service_headers(), timeout=(5, 15))
+            if response.status_code < 500 or attempt == 1:
+                break
+            current_app.logger.warning("Geoapify geocoding returned HTTP %s; retrying once.", response.status_code)
+        except requests.RequestException as error:
+            last_network_error = error
+            if attempt == 0:
+                current_app.logger.warning("Geoapify geocoding request failed (%s); retrying once.", type(error).__name__)
+                time.sleep(0.8)
+                continue
+            current_app.logger.warning("Geoapify geocoding request failed after retry (%s).", type(error).__name__)
+            raise ApiProblem("Place coordinates could not be resolved because the geocoding request failed twice. Please retry.", 503, "geocoding_network_error") from error
+    if response is None:
+        raise ApiProblem("Geoapify did not return a response. Please retry.", 503, "geocoding_network_error") from last_network_error
+    if response.status_code == 429:
+        raise ApiProblem("Geoapify geocoding quota was reached. Check your Geoapify dashboard and retry later.", 503, "geocoding_quota_exceeded")
+    if response.status_code in (401, 403):
+        current_app.logger.warning("Geoapify rejected the configured API key (HTTP %s).", response.status_code)
+        raise ApiProblem("Geoapify rejected the API key. Check GEOAPIFY_API_KEY and the key's permissions.", 503, "geocoding_provider_error")
+    if not response.ok:
+        current_app.logger.warning("Geoapify geocoding returned HTTP %s.", response.status_code)
+        if response.status_code >= 500:
+            raise ApiProblem("Geoapify geocoding is temporarily unavailable. Please retry.", 503, "geocoding_server_error")
+        raise ApiProblem("Geoapify rejected the geocoding request. Check the request parameters and API quota.", 503, "geocoding_provider_error")
+    try:
+        payload = response.json()
+    except ValueError as error:
+        raise ApiProblem("Geoapify returned an unreadable geocoding response.", 502, "geocoding_invalid_response") from error
+    results = payload.get("results", []) if isinstance(payload, dict) else []
+    return [item for item in results if isinstance(item, dict)] if isinstance(results, list) else []
 
+
+def _geo_result_coordinates(result: dict[str, Any]) -> tuple[float, float] | None:
+    try:
+        lat, lng = float(result["lat"]), float(result["lon"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+        return None
+    return lat, lng
+
+
+def _normalise_geo_label(label: str, result: dict[str, Any] | None = None) -> str:
+    """Make Geoapify's abbreviated Odisha state label readable and unambiguous."""
+    value = re.sub(r"\s+", " ", str(label or "")).strip()
+    result = result or {}
+    country = str(result.get("country") or "").strip().casefold()
+    country_code = str(result.get("country_code") or "").strip().casefold()
+    state = str(result.get("state") or "").strip().casefold()
+    state_code = str(result.get("state_code") or "").strip().casefold()
+    is_india = country == "india" or country_code == "in" or bool(re.search(r",\s*India\s*$", value, re.IGNORECASE))
+    is_odisha = state in {"or", "odisha", "orissa"} or state_code in {"in-or", "or"}
+    if is_india and (is_odisha or re.search(r",\s*(?:OR|Orissa)\s*,\s*India\s*$", value, re.IGNORECASE)):
+        value = re.sub(r",\s*(?:OR|Orissa)\s*,\s*India\s*$", ", Odisha, India", value, flags=re.IGNORECASE)
+    return value
+
+
+def _query_mentions_india(query: str) -> bool:
+    return bool(re.search(r"\bIndia\b", query, re.IGNORECASE))
+
+
+def _result_matches_explicit_country(result: dict[str, Any], query: str) -> bool:
+    """Do not let a global geocoder silently resolve an explicitly Indian destination elsewhere."""
+    if not _query_mentions_india(query):
+        return True
+    country = str(result.get("country") or "").strip().casefold()
+    country_code = str(result.get("country_code") or "").strip().casefold()
+    formatted = str(result.get("formatted") or "").strip().casefold()
+    if country:
+        return country == "india"
+    if country_code:
+        return country_code == "in"
+    return formatted.endswith(", india") or formatted == "india"
+
+
+def _distance_km(a_lat: float, a_lng: float, b_lat: float, b_lng: float) -> float:
+    radius_km = 6371.0088
+    phi1, phi2 = math.radians(a_lat), math.radians(b_lat)
+    d_phi = math.radians(b_lat - a_lat)
+    d_lam = math.radians(b_lng - a_lng)
+    h = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lam / 2) ** 2
+    return 2 * radius_km * math.asin(min(1.0, math.sqrt(h)))
+
+
+def _geocode_destination(destination: str, api_key: str) -> tuple[float, float, str]:
+    """Resolve a destination, including nearby-area inputs such as 'Sambalpur/Burla'."""
+    # Geoapify may abbreviate Odisha as "OR". In a country-qualified Indian
+    # destination, that means Odisha (formerly Orissa), not Oregon, USA.
+    destination = re.sub(r",\s*OR\s*,\s*India\s*$", ", Odisha, India", destination, flags=re.IGNORECASE).strip()
+    parts = [part.strip() for part in destination.split("/") if part.strip()]
+    if len(parts) > 1:
+        suffix = next((part[part.find(",") + 1:].strip() for part in reversed(parts) if "," in part), "")
+        if not suffix and any(term in destination.casefold() for term in ("sambalpur", "burla", "hirakud")):
+            suffix = "Odisha, India"
+        queries = [part if ("," in part or not suffix) else f"{part}, {suffix}" for part in parts]
+    else:
+        queries = [destination]
+
+    resolved: list[dict[str, Any]] = []
+    seen: set[tuple[float, float]] = set()
+    for query in queries:
+        results = _geoapify_geocode(query, api_key, limit=5)
+        # Only retain the highest-ranked valid match for each typed locality.
+        for result in results:
+            if not _result_matches_explicit_country(result, query):
+                current_app.logger.warning(
+                    "Discarding geocoder result outside the explicitly requested country for %r.", query[:100]
+                )
+                continue
+            coords = _geo_result_coordinates(result)
+            if not coords:
+                continue
+            key = (round(coords[0], 4), round(coords[1], 4))
+            if key not in seen:
+                seen.add(key)
+                resolved.append({"latitude": coords[0], "longitude": coords[1],
+                                 "formatted": _normalise_geo_label(str(result.get("formatted") or query), result),
+                                 "result_type": str(result.get("result_type") or "location"),
+                                 "name": str(result.get("name") or "")})
+            break
+        if len(parts) == 1 and resolved:
+            break
+
+    if not resolved:
+        raise ApiProblem(f"We couldn't identify '{destination}'. Add the state/country or choose a more specific destination.", 422, "destination_not_found")
+    if len(parts) > 1 and len(resolved) > 1:
+        first = resolved[0]
+        nearby = [p for p in resolved if _distance_km(first["latitude"], first["longitude"], p["latitude"], p["longitude"]) <= 90]
+        if len(nearby) > 1:
+            lat = sum(p["latitude"] for p in nearby) / len(nearby)
+            lng = sum(p["longitude"] for p in nearby) / len(nearby)
+            names: list[str] = []
+            for p in nearby:
+                short = p["formatted"].split(",")[0].strip()
+                if short and short.casefold() not in {n.casefold() for n in names}:
+                    names.append(short)
+            suffix = next((part[part.find(",") + 1:].strip() for part in reversed(parts) if "," in part), "")
+            if not suffix and any(term in destination.casefold() for term in ("sambalpur", "burla", "hirakud")):
+                suffix = "Odisha, India"
+            return lat, lng, " / ".join(names) + (f", {suffix}" if suffix else "")
+    best = resolved[0]
+    return best["latitude"], best["longitude"], best["formatted"]
+
+
+def _generate_gemma_place_recommendations(plan: dict[str, Any], resolved_destination: str) -> list[dict[str, str]]:
+    """Gemma is the recommender. Geocoding happens only after the model has chosen names."""
+    count = min(20, max(10, plan["duration"] * 4 + len(plan["interests"])))
+    schema = {
+        "type": "OBJECT", "required": ["places"],
+        "properties": {"places": {"type": "ARRAY", "items": {"type": "OBJECT",
+            "required": ["name", "category", "reason", "area"],
+            "properties": {"name": {"type": "STRING"}, "category": {"type": "STRING"},
+                           "reason": {"type": "STRING"}, "area": {"type": "STRING"}}}}}
+    }
+    prompt = f"""Recommend {count} real, specific visitor places or activity locations for a trip.
+Destination: {resolved_destination}
+User's original destination text: {plan['destination']}
+Interests: {json.dumps(plan['interests'], ensure_ascii=False)}
+Duration: {plan['duration']} days
+Budget: INR {plan['budget']} total for {plan['travelers']} traveller(s)
+Transport preference: {plan['transport']}
+
+You are the place recommender, not a search-query generator. Return actual named attractions, landmarks, activity hubs/operators, nature sites, heritage sites, and other visitor locations that fit the interests. Use local knowledge to recommend places that are specifically in or around this destination, and include relevant nearby towns only when genuinely practical. For water sports around Sambalpur/Burla/Hirakud, explicitly consider Hirakud Dam, Zero Point, the Right Dyke/Silat Road area, boat rides, boating and water-sports operators/launch points if they are known there. If the user selected "Popular / hot", prioritize widely recognized, iconic, frequently recommended must-visit places for the destination, not an unverified claim about today's live trends. Do not recommend places in unrelated cities or countries. Avoid generic filler and duplicates. Prefer well-known real places. Never invent exact addresses, coordinates, place IDs, opening hours, ratings, prices, or live availability. If the existence/name of a niche operator is uncertain, recommend a recognizable public access point or visitor area and say that the activity/operator needs confirmation. Do not claim water sports operate today.
+
+For each place, return:
+- name: the exact known name (or a specific named area/access point if that is the genuine recommendation)
+- category: short category such as Water sports, Boating, Landmark, Park, Museum, Temple, Viewpoint
+- reason: short explanation of why it fits the selected interests
+- area: local neighbourhood/road/town name that helps resolve it geographically
+
+Return JSON only: {{"places":[{{"name":"...","category":"...","reason":"...","area":"..."}}]}}. Return at least {min(10, count)} recommendations if you can name that many real relevant places; never pad the list with made-up entries."""
+    response = _call_gemma_json(prompt, schema, "place recommendations", max_tokens=3500)
+    raw_places = response.get("places", [])
+    if not isinstance(raw_places, list):
+        raise ApiProblem("Gemma did not return a valid place recommendation list. Please retry.", 502, "gemma_invalid_response")
+    places: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw_places:
+        if not isinstance(item, dict):
+            continue
+        name = re.sub(r"\s+", " ", str(item.get("name") or "")).strip(" \t\r\n\"'`.-")
+        if not name or len(name) > 140 or name.casefold() in seen:
+            continue
+        seen.add(name.casefold())
+        places.append({
+            "name": name,
+            "category": str(item.get("category") or "Point of interest").strip()[:80],
+            "reason": str(item.get("reason") or "Suggested by Gemma for the selected interests.").strip()[:450],
+            "area": str(item.get("area") or resolved_destination).strip()[:120],
+        })
+        if len(places) >= 24:
+            break
+    if not places:
+        raise ApiProblem("Gemma did not return any usable place recommendations. Please retry.", 502, "gemma_no_place_recommendations")
     return places
 
 
-def discover_places(destination: str, interests: list[str]) -> tuple[list[dict[str, Any]], str]:
-    """Resolve a destination and retrieve real OSM-based POIs via Geoapify."""
-    api_key = _require_env("GEOAPIFY_API_KEY", "search real places and resolve destinations")
-    cache_key = f"{destination.casefold().strip()}|{','.join(sorted(i.casefold() for i in interests))}"
-    cached = _PLACE_CACHE.get(cache_key)
-    if cached and time.monotonic() - cached[0] < _PLACE_CACHE_TTL_SECONDS:
-        cached_resolved_destination, _cached_key, cached_places = cached[1]
-        return [dict(place) for place in cached_places], cached_resolved_destination
+def _normal_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
 
-    latitude, longitude, resolved_destination = _geoapify_geocode(destination, api_key)
-    places = _discover_geoapify_places(destination, latitude, longitude, interests, api_key)
-    if not places:
+
+def _name_match_score(wanted: str, result: dict[str, Any]) -> float:
+    """Check that geocoding resolved the recommended name, not just the city centre."""
+    from difflib import SequenceMatcher
+    candidates = [str(result.get("name") or ""), str(result.get("address_line1") or ""),
+                  str(result.get("formatted") or "").split(",")[0]]
+    target = _normal_name(wanted)
+    wanted_tokens = set(target.split())
+    best = 0.0
+    for value in candidates:
+        normalized = _normal_name(value)
+        if not normalized:
+            continue
+        if normalized == target:
+            return 1.0
+        result_tokens = set(normalized.split())
+        overlap = len(wanted_tokens & result_tokens) / max(1, len(wanted_tokens))
+        best = max(best, SequenceMatcher(None, target, normalized).ratio(), overlap)
+    return best
+
+
+def _discover_gemma_places(plan: dict[str, Any]) -> tuple[list[dict[str, Any]], str, dict[str, float]]:
+    """Gemma chooses recommended places; Geoapify only resolves those exact names to coordinates."""
+    api_key = _geoapify_key()
+    latitude, longitude, resolved_destination = _geocode_destination(plan["destination"], api_key)
+    recommendations = _generate_gemma_place_recommendations(plan, resolved_destination)
+    current_app.logger.info("Gemma proposed %d named locations for %r; resolving their coordinates.", len(recommendations), resolved_destination)
+    by_id: dict[str, dict[str, Any]] = {}
+    unmapped: list[str] = []
+    geocoding_failures = 0
+    consecutive_geocoding_failures = 0
+    for recommendation in recommendations:
+        # First try the fully contextualized recommendation. If an exact area plus
+        # destination is too restrictive for the geocoder, retry the shorter name
+        # with destination context while keeping the same 50 km geographic fence.
+        query_parts = [recommendation["name"]]
+        if recommendation["area"] and _normal_name(recommendation["area"]) not in _normal_name(recommendation["name"]):
+            query_parts.append(recommendation["area"])
+        query_parts.append(resolved_destination)
+        primary_query = ", ".join(part for part in query_parts if part)
+        fallback_query = ", ".join(part for part in [recommendation["name"], resolved_destination] if part)
+        lookup_queries = list(dict.fromkeys([primary_query, fallback_query]))
+        scored: list[tuple[float, float, dict[str, Any], tuple[float, float]]] = []
+    
+        for query_index, query in enumerate(lookup_queries):
+            try:
+                results = _geoapify_geocode(query, api_key, center=(latitude, longitude), radius_km=50, limit=5)
+                consecutive_geocoding_failures = 0
+            except ApiProblem as error:
+                # Invalid keys and exhausted quotas should fail fast. A transient network/server
+                # failure for one name should not discard every other recommendation.
+                if error.code in {"geocoding_provider_error", "geocoding_quota_exceeded"}:
+                    raise
+                geocoding_failures += 1
+                consecutive_geocoding_failures += 1
+                current_app.logger.warning(
+                    "Skipping coordinate lookup variant %d for %r after temporary geocoding failure (code=%s).",
+                    query_index + 1, recommendation["name"][:100], error.code,
+                )
+                if consecutive_geocoding_failures >= 3 and not by_id:
+                    raise ApiProblem(
+                        "Geoapify is repeatedly failing to resolve recommended places. Check your connection and retry.",
+                        503, "geocoding_temporarily_unavailable",
+                    ) from error
+                continue
+
+            for result in results:
+                if not _result_matches_explicit_country(result, query):
+                    continue
+                coords = _geo_result_coordinates(result)
+                if not coords:
+                    continue
+                distance = _distance_km(latitude, longitude, coords[0], coords[1])
+                if distance > 50:
+                    continue
+                score = _name_match_score(recommendation["name"], result)
+                # Never accept a result that merely geocoded to the destination/city centre.
+                if score < 0.48:
+                    continue
+                scored.append((score, distance, result, coords))
+
+            if scored:
+                break
+
+        if not scored:
+            unmapped.append(recommendation["name"])
+            current_app.logger.info(
+                "Could not verify coordinates for Gemma recommendation %r after %d query variant(s).",
+                recommendation["name"][:100], len(lookup_queries),
+            )
+            continue
+
+        scored.sort(key=lambda entry: (-entry[0], entry[1]))
+        score, distance, result, coords = scored[0]
+        lat, lng = coords
+        # Avoid placing different model suggestions on top of the same geocoder result.
+        if any(_distance_km(lat, lng, float(p["latitude"]), float(p["longitude"])) < 0.08 for p in by_id.values()):
+            continue
+        place_id = "gemma-" + hashlib.sha1(f"{recommendation['name'].casefold()}|{lat:.5f}|{lng:.5f}".encode("utf-8")).hexdigest()[:16]
+        formatted = _normalise_geo_label(str(result.get("formatted") or f"{recommendation['name']}, {resolved_destination}"), result)
+        map_url = f"https://www.openstreetmap.org/?mlat={lat:.6f}&mlon={lng:.6f}#map=16/{lat:.6f}/{lng:.6f}"
+        by_id[place_id] = {
+            "id": place_id, "place_id": place_id, "name": recommendation["name"],
+            "description": recommendation["reason"], "category": recommendation["category"],
+            "categories": [recommendation["category"]], "types": [recommendation["category"]],
+            "address": formatted, "latitude": lat, "longitude": lng,
+            "rating": None, "maps_url": map_url, "map_url": map_url,
+            "provider": "Gemma recommendation; Geoapify geocoding; OpenStreetMap map",
+            "distance_from_destination_km": round(distance, 2),
+            "matched_queries": [", ".join(plan["interests"]) or "general sightseeing"],
+            "entry_fee_known": False, "estimated_entry_fee_per_person": 0,
+            "visit_duration_minutes": 90, "visit_duration_is_estimate": True,
+            "costs_are_estimates": True,
+            "planning_notes": "Gemma suggested this location. Coordinates were resolved by geocoding; verify the venue, activity availability, opening hours and prices before travelling.",
+            "recommendation_reason": recommendation["reason"],
+            "coordinate_match_score": round(score, 2),
+        }
+    current_app.logger.info(
+        "Resolved %d/%d Gemma recommendations; %d could not be mapped and %d geocoding requests failed temporarily.",
+        len(by_id), len(recommendations), len(unmapped), geocoding_failures,
+    )
+    if len(by_id) < 1:
+        if geocoding_failures:
+            raise ApiProblem(
+                "Geoapify could not resolve Gemma's recommended places because geocoding requests failed or timed out. Please retry.",
+                503, "geocoding_temporarily_unavailable",
+            )
+        missing = ", ".join(unmapped[:5])
+        note = f" Unmapped model suggestions: {missing}." if missing else ""
+        raise ApiProblem(f"Gemma suggested places, but none could be verified on the map near {resolved_destination}. Try a more specific destination or review the suggested names.{note}", 422, "not_enough_mappable_gemma_places")
+    return _rank_places(list(by_id.values()), plan["interests"]), resolved_destination, {"latitude": latitude, "longitude": longitude}
+
+
+
+
+
+INTEREST_TERMS: dict[str, tuple[str, ...]] = {
+    "nature": ("nature", "park", "garden", "forest", "mountain", "waterfall", "lake", "trail", "scenic", "dam", "reservoir"),
+    "history": ("history", "historical", "museum", "monument", "fort", "palace", "landmark", "heritage", "memorial", "tower"),
+    "temples": ("temple", "shrine", "worship", "religious", "church", "mosque", "monastery", "pagoda"),
+    "beaches": ("beach", "coast", "seaside", "waterfront", "island", "bay"),
+    "local food": ("food", "restaurant", "market", "cafe", "café", "bakery", "street food", "food court"),
+    "adventure": ("adventure", "water sports", "watersport", "boating", "boat", "kayak", "jet ski", "rafting", "hiking", "climbing", "outdoor", "ski", "trail", "amusement", "operator"),
+    "photography": ("viewpoint", "scenic", "lookout", "landmark", "garden", "skyline", "waterfront", "tower"),
+    "popular / hot": ("famous", "iconic", "well known", "well-known", "must-see", "must see", "top attraction", "hotspot", "hot spot"),
+    "hidden gems": ("local", "village", "craft", "neighbourhood", "neighborhood", "market", "art district"),
+}
+
+
+def _call_gemma_json(prompt: str, response_schema: dict[str, Any], purpose: str, max_tokens: int = 2400) -> dict[str, Any]:
+    """Call hosted Gemma with structured output and a second-model fallback.
+
+    Do not fall back to plain-text mode: this project's tested Gemma endpoint can
+    fail on plain generation while succeeding with response_schema. For HTTP 5xx
+    failures, retry briefly then try the other Gemma 4 model with the same schema.
+    """
+    api_key = _require_env("GEMMA_API_KEY", "generate a travel plan")
+    primary = os.getenv("GEMMA_MODEL", "gemma-4-31b-it").strip() or "gemma-4-31b-it"
+    configured_fallback = os.getenv("GEMMA_FALLBACK_MODEL", "").strip()
+    known_gemma_models = ["gemma-4-31b-it", "gemma-4-26b-a4b-it"]
+    model_names: list[str] = []
+    for name in [primary, configured_fallback, *known_gemma_models]:
+        if name and name not in model_names:
+            model_names.append(name)
+
+    client = genai.Client(api_key=api_key)
+    system_instruction = (
+        "You are a precise RoamWise travel-planning component. Follow the requested JSON schema. "
+        "Never invent real-world place records. Return one JSON object matching the schema."
+    )
+    last_error: Exception | None = None
+
+    for model_index, model_name in enumerate(model_names):
+        request_prompt = prompt
+        format_retry_used = False
+        transient_retries = 0
+        max_transient_retries = 2 if model_index == 0 else 1
+        while True:
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=request_prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        temperature=0.1 if purpose == "search-query generation" else 0.0,
+                        max_output_tokens=max_tokens,
+                        response_mime_type="application/json",
+                        response_schema=response_schema,
+                        thinking_config=types.ThinkingConfig(thinking_level="minimal"),
+                    ),
+                )
+                output = _gemma_response_text(response)
+                try:
+                    parsed = _parse_model_json(output)
+                    if model_name != primary:
+                        current_app.logger.warning(
+                            "Gemma %s succeeded using fallback model=%s (primary=%s).", purpose, model_name, primary
+                        )
+                    return parsed
+                except (ValueError, json.JSONDecodeError) as error:
+                    last_error = error
+                    if not format_retry_used:
+                        format_retry_used = True
+                        request_prompt = prompt + (
+                            "\n\nRETRY: Return a complete JSON object that exactly follows the supplied response schema. "
+                            "No markdown or prose. Keep the response concise and do not add extra fields."
+                        )
+                        current_app.logger.warning(
+                            "Gemma %s JSON could not be parsed (model=%s); retrying once with structured output enabled.",
+                            purpose, model_name,
+                        )
+                        continue
+                    break
+            except Exception as error:
+                last_error = error
+                message = str(error).lower()
+                raw_status = getattr(error, "code", None) or getattr(error, "status_code", None)
+                try:
+                    status_code = int(raw_status) if raw_status is not None and not callable(raw_status) else None
+                except (TypeError, ValueError):
+                    status_code = None
+
+                transient = status_code in (408, 429, 500, 502, 503, 504) or any(
+                    marker in message for marker in (
+                        "internal server error", "service unavailable", "resource_exhausted",
+                        "too many requests", "timed out", "timeout", "connection reset",
+                    )
+                )
+                # Don't waste requests on permanent credential/permission failures.
+                if status_code in (401, 403):
+                    break
+                if transient and transient_retries < max_transient_retries:
+                    delay = 1.5 * (2 ** transient_retries)
+                    transient_retries += 1
+                    current_app.logger.warning(
+                        "Gemma %s call failed transiently (model=%s, status=%s); retry %d/%d in %.1fs.",
+                        purpose, model_name, status_code or type(error).__name__,
+                        transient_retries, max_transient_retries, delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                # Any server-side failure moves to the next supported Gemma model.
+                break
+
+        if model_index < len(model_names) - 1:
+            current_app.logger.warning(
+                "Gemma %s failed with model=%s; trying fallback model=%s with structured output.",
+                purpose, model_name, model_names[model_index + 1],
+            )
+
+    if isinstance(last_error, (ValueError, json.JSONDecodeError)):
+        current_app.logger.error("Gemma %s returned invalid structured JSON across available models.", purpose)
         raise ApiProblem(
-            f"RoamWise doesn't have enough place data for {destination} right now. Try a better-known nearby city or another destination.",
-            422,
-            "destination_not_available",
-        )
-    _PLACE_CACHE[cache_key] = (time.monotonic(), (resolved_destination, api_key, [dict(place) for place in places]))
-    return places, resolved_destination
+            f"Gemma returned invalid structured JSON for {purpose}. Please retry.",
+            502, "gemma_invalid_response",
+        ) from last_error
+
+    raw_status = getattr(last_error, "code", None) or getattr(last_error, "status_code", None)
+    current_app.logger.error(
+        "Gemma %s failed across configured models=%s (last_status=%s, error_type=%s).",
+        purpose, ",".join(model_names), raw_status or "unknown",
+        type(last_error).__name__ if last_error else "unknown",
+    )
+    raise ApiProblem(
+        f"Gemma could not complete {purpose} using any configured Gemma model. "
+        "The hosted model API returned repeated errors; wait briefly and retry, or check Google AI Studio service health.",
+        503, "gemma_unavailable",
+    ) from last_error
 
 
 def _rank_places(places: list[dict[str, Any]], interests: list[str]) -> list[dict[str, Any]]:
-    if not interests:
-        return places
-
-    def score(place: dict[str, Any]) -> int:
+    def score(place: dict[str, Any]) -> tuple[float, float, str]:
         searchable = " ".join(
             [str(place.get(key) or "") for key in ("name", "category", "address")] +
-            [str(value) for value in (place.get("categories") or [])]
-        ).lower()
-        return sum(
-            1 for interest in interests
-            for term in INTEREST_TERMS.get(interest.lower(), (interest.lower(),))
-            if term in searchable
-        )
+            [str(value) for value in (place.get("categories") or [])] +
+            [str(value) for value in (place.get("matched_queries") or [])]
+        ).casefold()
+        match_score = len(place.get("matched_queries") or []) * 8
+        for interest in interests:
+            terms = INTEREST_TERMS.get(interest.casefold(), (interest.casefold(),))
+            match_score += sum(1 for term in terms if term in searchable)
+        distance = float(place.get("distance_from_destination_km") or 0.0)
+        return (-match_score, distance, str(place.get("name", "")).casefold())
+    return sorted(places, key=score)
 
-    return sorted(places, key=score, reverse=True)
+
+
+
+
+def _route_mode(transport: str) -> str:
+    if transport == "Walking":
+        return "WALK"
+    if transport == "Public transport":
+        return "TRANSIT"
+    return "DRIVE"
+
+
+def _approximate_minutes(distance_km: float, mode: str) -> int:
+    speed = {"WALK": 4.5, "TRANSIT": 20.0, "DRIVE": 25.0}.get(mode, 25.0)
+    return max(1, int(round((distance_km / speed) * 60 + 4)))
+
+
+def _routing_base(transport: str) -> tuple[str, str]:
+    if transport == "Walking":
+        return OSRM_FOOT_BASE.rstrip("/"), "walking"
+    if transport == "Public transport":
+        return "", "public transport"
+    return OSRM_CAR_BASE.rstrip("/"), "driving"
+
+
+def _osrm_get(url: str, params: dict[str, Any], timeout: tuple[int, int]) -> requests.Response:
+    """Throttled helper for community OSRM servers; no API key or billing required."""
+    global _OSRM_LAST_REQUEST_FINISHED
+    with _OSRM_REQUEST_LOCK:
+        wait = 1.05 - (time.monotonic() - _OSRM_LAST_REQUEST_FINISHED)
+        if _OSRM_LAST_REQUEST_FINISHED and wait > 0:
+            time.sleep(wait)
+        response = requests.get(url, params=params, headers=_service_headers(), timeout=timeout)
+        _OSRM_LAST_REQUEST_FINISHED = time.monotonic()
+        return response
+
+
+def _compute_route_matrix(places: list[dict[str, Any]], transport: str) -> tuple[dict[str, dict[str, dict[str, Any]]], str]:
+    """Use an OpenStreetMap OSRM table when supported, otherwise labelled estimates."""
+    size = len(places)
+    matrix: dict[str, dict[str, dict[str, Any]]] = {str(p["id"]): {} for p in places}
+    base, mode_label = _routing_base(transport)
+    source = "straight-line estimates (public-transit routing is not configured)" if not base else f"OpenStreetMap OSRM {mode_label} routes"
+    if size == 0:
+        return matrix, source
+    if base and size >= 2:
+        coords = ";".join(f"{float(p['longitude'])},{float(p['latitude'])}" for p in places)
+        try:
+            response = _osrm_get(f"{base}/table/v1/driving/{coords}", params={"annotations": "duration,distance"}, timeout=(5, 25))
+            if response.ok:
+                payload = response.json()
+                durations = payload.get("durations") if isinstance(payload, dict) else None
+                distances = payload.get("distances") if isinstance(payload, dict) else None
+                if isinstance(durations, list) and len(durations) == size:
+                    for i, origin in enumerate(places):
+                        oid = str(origin["id"])
+                        row_d = durations[i] if isinstance(durations[i], list) else []
+                        row_k = distances[i] if isinstance(distances, list) and i < len(distances) and isinstance(distances[i], list) else []
+                        for j, target in enumerate(places):
+                            did = str(target["id"])
+                            dseconds = row_d[j] if j < len(row_d) else None
+                            dm = row_k[j] if j < len(row_k) else None
+                            if i == j:
+                                matrix[oid][did] = {"minutes": 0, "distance_km": 0.0, "source": source}
+                            elif dseconds is not None:
+                                matrix[oid][did] = {"minutes": max(1, int(round(float(dseconds) / 60)),),
+                                                    "distance_km": round(float(dm) / 1000, 2) if dm is not None else round(_distance_km(float(origin["latitude"]), float(origin["longitude"]), float(target["latitude"]), float(target["longitude"])), 2),
+                                                    "source": source}
+                    if sum(len(row) for row in matrix.values()) >= size:
+                        for i, origin in enumerate(places):
+                            for j, target in enumerate(places):
+                                oid, did = str(origin["id"]), str(target["id"])
+                                if did not in matrix[oid]:
+                                    dist = _distance_km(float(origin["latitude"]), float(origin["longitude"]), float(target["latitude"]), float(target["longitude"]))
+                                    matrix[oid][did] = {"minutes": 0 if i == j else _approximate_minutes(dist, "WALK" if transport == "Walking" else "DRIVE"), "distance_km": round(dist, 2), "source": "straight-line estimate"}
+                        return matrix, source + " (estimates for unreachable pairs)"
+            else:
+                current_app.logger.warning("OSRM table returned HTTP %s; using straight-line estimates.", response.status_code)
+        except (requests.RequestException, ValueError, TypeError) as error:
+            current_app.logger.warning("OSRM table unavailable (%s); using straight-line estimates.", type(error).__name__)
+    for i, origin in enumerate(places):
+        for j, target in enumerate(places):
+            oid, did = str(origin["id"]), str(target["id"])
+            dist = _distance_km(float(origin["latitude"]), float(origin["longitude"]), float(target["latitude"]), float(target["longitude"]))
+            matrix[oid][did] = {"minutes": 0 if i == j else _approximate_minutes(dist, "WALK" if transport == "Walking" else "DRIVE"), "distance_km": round(dist, 2), "source": "straight-line estimate"}
+    return matrix, source if base else source
+
+
+def _optimize_activity_order(activities: list[dict[str, Any]], matrix: dict[str, dict[str, dict[str, Any]]]) -> list[dict[str, Any]]:
+    """Optimize each day's open route with OR-Tools; fall back to exact permutations for small days."""
+    n = len(activities)
+    if n < 3:
+        return activities
+    ids = [str(activity.get("place_id") or activity.get("attraction_id") or "") for activity in activities]
+    def cost(i: int, j: int) -> int:
+        return 0 if i == j else max(0, _matrix_minutes(matrix, ids[i], ids[j]))
+    # A short day is small enough to solve exactly, including a free choice of start/end.
+    if n <= 8:
+        from itertools import permutations
+        best_order = tuple(range(n))
+        best_cost = float("inf")
+        for order in permutations(range(n)):
+            total = sum(cost(a, b) for a, b in zip(order, order[1:]))
+            if total < best_cost:
+                best_cost, best_order = total, order
+        return [activities[i] for i in best_order]
+    try:
+        from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+        dummy = n
+        manager = pywrapcp.RoutingIndexManager(n + 1, 1, [dummy], [dummy])
+        routing = pywrapcp.RoutingModel(manager)
+        def transit(from_index: int, to_index: int) -> int:
+            i, j = manager.IndexToNode(from_index), manager.IndexToNode(to_index)
+            if i == dummy or j == dummy:
+                return 0  # open route: no fixed depot or return trip
+            return cost(i, j)
+        callback = routing.RegisterTransitCallback(transit)
+        routing.SetArcCostEvaluatorOfAllVehicles(callback)
+        search = pywrapcp.DefaultRoutingSearchParameters()
+        search.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+        search.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+        search.time_limit.seconds = 2
+        solution = routing.SolveWithParameters(search)
+        if solution:
+            ordered_indexes = []
+            index = routing.Start(0)
+            while not routing.IsEnd(index):
+                node = manager.IndexToNode(index)
+                if node != dummy:
+                    ordered_indexes.append(node)
+                index = solution.Value(routing.NextVar(index))
+            if len(ordered_indexes) == n:
+                return [activities[i] for i in ordered_indexes]
+    except Exception as error:
+        current_app.logger.warning("OR-Tools route optimization fell back (%s).", type(error).__name__)
+    # Reliable heuristic fallback: try each start, then repeatedly take the nearest next stop.
+    best: list[int] = []
+    best_cost = float("inf")
+    for start in range(n):
+        remaining = set(range(n)) - {start}
+        order = [start]
+        while remaining:
+            last = order[-1]
+            nxt = min(remaining, key=lambda j: (cost(last, j), j))
+            order.append(nxt)
+            remaining.remove(nxt)
+        total = sum(cost(a, b) for a, b in zip(order, order[1:]))
+        if total < best_cost:
+            best, best_cost = order, total
+    return [activities[i] for i in best]
+
+
+def _matrix_minutes(matrix: dict[str, dict[str, dict[str, Any]]], origin_id: str, destination_id: str) -> int:
+    try:
+        return int(matrix[origin_id][destination_id]["minutes"])
+    except (KeyError, TypeError, ValueError):
+        return 30
+
+
+def _generate_gemma_itinerary(plan: dict[str, Any], places: list[dict[str, Any]], resolved_destination: str, route_matrix: dict[str, dict[str, dict[str, Any]]], route_source: str) -> list[dict[str, Any]]:
+    """Build the itinerary without a second LLM call, then optimize day routes locally.
+
+    Gemma is the source of place recommendations. Route ordering/day allocation is a
+    combinatorial optimization problem, so a second Gemma request adds latency and an
+    unnecessary failure point without being needed to invent itinerary structure.
+    """
+    candidates = _rank_places(places, plan["interests"])
+    # Plan approximately four stops per day, and never send every model suggestion
+    # straight into an itinerary if the trip is short.
+    candidate_limit = min(len(candidates), MAX_CANDIDATES_FOR_ROUTING, max(plan["duration"], plan["duration"] * 4))
+    candidates = candidates[:candidate_limit]
+    if not candidates:
+        raise ApiProblem("No mapped Gemma recommendations are available to plan this trip.", 422, "no_mappable_places")
+
+    day_count = min(plan["duration"], len(candidates))
+    day_groups: list[list[dict[str, Any]]] = [[] for _ in range(day_count)]
+
+    def make_activity(place: dict[str, Any]) -> dict[str, Any]:
+        searchable = f"{place.get('name', '')} {place.get('category', '')} {place.get('recommendation_reason', '')}".casefold()
+        if any(term in searchable for term in ("water sport", "watersport", "boating", "boat ride", "kayak", "jet ski", "rafting")):
+            visit_minutes = 120
+        elif any(term in searchable for term in ("museum", "fort", "palace", "dam tour", "guided tour")):
+            visit_minutes = 90
+        else:
+            visit_minutes = 60
+        return {
+            "attraction_id": str(place["id"]), "place_id": str(place["id"]),
+            "name": str(place["name"]),
+            "description": str(place.get("recommendation_reason") or place.get("description") or f"Recommended by Gemma for {', '.join(plan['interests']) or 'your trip'}.")[:450],
+            "category": str(place.get("category") or "Point of interest"),
+            "estimated_cost": 0, "estimated_entry_fee_per_person": 0,
+            "entry_fee_known": False, "visit_duration_minutes": visit_minutes,
+            "visit_duration_is_estimate": True,
+            "planning_notes": "Gemma recommended this location; the name was geocoded for mapping. Verify the exact venue, activity availability, opening hours, and prices before travelling.",
+            "address": str(place.get("address") or ""),
+            "latitude": float(place["latitude"]), "longitude": float(place["longitude"]),
+            "rating": place.get("rating"), "maps_url": str(place.get("maps_url") or place.get("map_url") or ""),
+            "provider": str(place.get("provider") or "Gemma recommendation"),
+            "costs_are_estimates": True,
+        }
+
+    # Seed each day with a high-ranked recommendation. Then place each remaining
+    # location where it adds the least route time, with a small balancing cost so
+    # one day does not absorb every attraction.
+    for idx, place in enumerate(candidates[:day_count]):
+        day_groups[idx].append(make_activity(place))
+
+    def route_cost(items: list[dict[str, Any]]) -> int:
+        return sum(_matrix_minutes(route_matrix, str(a["place_id"]), str(b["place_id"]))
+                   for a, b in zip(items, items[1:]))
+
+    for place in candidates[day_count:]:
+        activity = make_activity(place)
+        best_choice: tuple[float, int, int, list[dict[str, Any]]] | None = None
+        for day_idx, existing in enumerate(day_groups):
+            old_cost = route_cost(existing)
+            for insert_at in range(len(existing) + 1):
+                proposed = existing[:insert_at] + [activity] + existing[insert_at:]
+                delta = route_cost(proposed) - old_cost
+                # Lightly balance the number of stops and planned duration per day.
+                load_penalty = len(existing) * 12 + sum(int(x["visit_duration_minutes"]) for x in existing) * 0.04
+                choice = (delta + load_penalty, day_idx, insert_at, proposed)
+                if best_choice is None or choice[:3] < best_choice[:3]:
+                    best_choice = choice
+        if best_choice:
+            _, day_idx, _insert_at, proposed = best_choice
+            day_groups[day_idx] = proposed
+
+    itinerary: list[dict[str, Any]] = []
+    for day_idx, activities in enumerate(day_groups, start=1):
+        activities = _optimize_activity_order(activities, route_matrix)
+        # Stay within a realistic planned day. Keep the first/highest-value stop,
+        # and trim the end of the optimized route if transfer + visit estimates exceed 8h.
+        note = "Places were recommended by Gemma and mapped using geocoding. Confirm opening hours, activity operations, and prices before travelling."
+        while len(activities) > 1:
+            visit_total = sum(int(a["visit_duration_minutes"]) for a in activities)
+            transfer_total = route_cost(activities)
+            if visit_total + transfer_total <= 8 * 60:
+                break
+            activities = activities[:-1]
+            note = "The final stop was omitted to keep estimated visits and transfers within an eight-hour day."
+            activities = _optimize_activity_order(activities, route_matrix)
+        categories = []
+        for activity in activities:
+            category = str(activity.get("category") or "Highlights")
+            if category.casefold() not in {item.casefold() for item in categories}:
+                categories.append(category)
+        theme = " & ".join(categories[:2]) if categories else f"Day {day_idx} highlights"
+        travel_minutes = sum(_matrix_minutes(route_matrix, str(a["place_id"]), str(b["place_id"])) for a, b in zip(activities, activities[1:]))
+        travel_distance = sum(float(route_matrix.get(str(a["place_id"]), {}).get(str(b["place_id"]), {}).get("distance_km", 0)) for a, b in zip(activities, activities[1:]))
+        itinerary.append({
+            "day": day_idx,
+            "theme": theme[:100],
+            "activities": activities,
+            "note": note,
+            "travel_minutes_estimate": travel_minutes,
+            "travel_distance_km_estimate": round(travel_distance, 1),
+            "route_time_source": route_source,
+        })
+
+    # Preserve the API contract: exactly the requested number of day objects.
+    while len(itinerary) < plan["duration"]:
+        day_no = len(itinerary) + 1
+        itinerary.append({
+            "day": day_no, "theme": f"Day {day_no} highlights", "activities": [],
+            "note": "Not enough verified mapped recommendations were available to add a stop on this day.",
+            "travel_minutes_estimate": 0, "travel_distance_km_estimate": 0.0,
+            "route_time_source": route_source,
+        })
+    return itinerary
+
+
+def _attach_open_route_paths(itinerary: list[dict[str, Any]], plan: dict[str, Any], places_by_id: dict[str, dict[str, Any]]) -> None:
+    """Attach OSRM route geometry for the stop sequence, when the public router supports it."""
+    base, _mode = _routing_base(plan.get("transport", "Flexible"))
+    for day in itinerary:
+        activities = day.get("activities", [])
+        stops = [places_by_id.get(str(a.get("place_id") or a.get("attraction_id"))) for a in activities]
+        stops = [p for p in stops if p and p.get("latitude") is not None and p.get("longitude") is not None]
+        if len(stops) < 2 or not base:
+            day["route_path"] = []
+            continue
+        coordinates = ";".join(f"{float(p['longitude'])},{float(p['latitude'])}" for p in stops)
+        try:
+            response = _osrm_get(f"{base}/route/v1/driving/{coordinates}",
+                                 params={"overview": "full", "geometries": "geojson", "steps": "false"},
+                                 timeout=(5, 20))
+            if not response.ok:
+                day["route_path"] = []
+                continue
+            payload = response.json()
+            routes = payload.get("routes", []) if isinstance(payload, dict) else []
+            route = routes[0] if routes else {}
+            coords = ((route.get("geometry") or {}).get("coordinates") or []) if isinstance(route, dict) else []
+            day["route_path"] = [{"latitude": float(pt[1]), "longitude": float(pt[0])} for pt in coords if isinstance(pt, (list, tuple)) and len(pt) >= 2]
+            if route.get("duration") is not None:
+                day["travel_minutes_estimate"] = int(round(float(route["duration"]) / 60))
+            if route.get("distance") is not None:
+                day["travel_distance_km_estimate"] = round(float(route["distance"]) / 1000, 1)
+        except (requests.RequestException, ValueError, TypeError, KeyError) as error:
+            current_app.logger.warning("OSRM route geometry unavailable for day %s (%s).", day.get("day"), type(error).__name__)
+            day["route_path"] = []
 
 
 def _parse_model_json(text: str) -> dict[str, Any]:
@@ -515,272 +1105,6 @@ def _gemma_response_text(response: Any) -> str:
     return "\n".join(collected).strip()
 
 
-def _generate_gemma_itinerary(plan: dict[str, Any], places: list[dict[str, Any]], resolved_destination: str) -> list[dict[str, Any]]:
-    api_key = _require_env("GEMMA_API_KEY", "generate personalized itineraries")
-    model_name = os.getenv("GEMMA_MODEL", "gemma-4-26b-a4b-it").strip() or "gemma-4-26b-a4b-it"
-    # Limit the prompt size while preserving provider-ranked candidates.
-    candidates = _rank_places(places, plan["interests"])[:60]
-    candidates_by_id = {place["id"]: place for place in candidates}
-    compact_places = [
-        {
-            "place_id": place["id"],
-            "name": place["name"],
-            "category": place["category"],
-            "address": place["address"],
-        }
-        for place in candidates
-    ]
-    system_instruction = (
-        "You are RoamWise, a careful travel-itinerary planner. You must only select places from the supplied candidate list. "
-        "Never invent a place, provider ID, address, opening hour, ticket price, or factual claim not supported by input. "
-        "If a place's exact details are not provided, phrase recommendations as suggestions, not verified facts. "
-        "Output one JSON object only. Do not include markdown fences, analysis, or text before or after the JSON."
-    )
-    prompt = f"""Create a practical itinerary using only the place candidates listed below.
-Destination resolved by the provider: {resolved_destination}
-User destination text: {plan['destination']}
-Duration: {plan['duration']} days
-Group budget: INR {plan['budget']}
-Travelers: {plan['travelers']}
-Transportation: {plan['transport']}
-Interests: {json.dumps(plan['interests'], ensure_ascii=False)}
-
-CANDIDATE PLACES (each place_id must be copied exactly; never create IDs):
-{json.dumps(compact_places, ensure_ascii=False)}
-
-Requirements:
-- Return exactly {plan['duration']} day objects with day numbers 1 through {plan['duration']}.
-- Use 2-3 different places per day when enough candidates exist; never repeat a place.
-- Choose places that best fit the user's interests. Keep the schedule realistic.
-- duration_minutes must be an integer from 30 to 180.
-- Do not invent ticket prices, opening hours, historic facts, or other unsupported claims.
-- If there are not enough appropriate candidates, return fewer activities and explain in the day's note. Never invent a replacement.
-- Return only this JSON shape:
-{{
-  "days": [
-    {{
-      "day": 1,
-      "theme": "short theme",
-      "activities": [
-        {{"place_id": "copy an exact place_id from the candidates", "duration_minutes": 90, "reason": "brief recommendation reason grounded in candidate information"}}
-      ],
-      "note": "optional short note"
-    }}
-  ],
-  "general_tips": ["short practical caveat"]
-}}
-"""
-
-    response_schema = {
-        "type": "OBJECT",
-        "required": ["days", "general_tips"],
-        "properties": {
-            "days": {
-                "type": "ARRAY",
-                "items": {
-                    "type": "OBJECT",
-                    "required": ["day", "theme", "activities"],
-                    "properties": {
-                        "day": {"type": "INTEGER"},
-                        "theme": {"type": "STRING"},
-                        "note": {"type": "STRING"},
-                        "activities": {
-                            "type": "ARRAY",
-                            "items": {
-                                "type": "OBJECT",
-                                "required": ["place_id", "duration_minutes", "reason"],
-                                "properties": {
-                                    "place_id": {"type": "STRING"},
-                                    "duration_minutes": {"type": "INTEGER"},
-                                    "reason": {"type": "STRING"},
-                                },
-                            },
-                        },
-                    },
-                },
-            },
-            "general_tips": {"type": "ARRAY", "items": {"type": "STRING"}},
-        },
-    }
-
-    client = genai.Client(api_key=api_key)
-    structured_output_supported = True
-
-    def generate_response(contents: str):
-        nonlocal structured_output_supported
-        if structured_output_supported:
-            try:
-                return client.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_instruction,
-                        temperature=0.1,
-                        max_output_tokens=5000,
-                        response_mime_type="application/json",
-                        response_schema=response_schema,
-                    ),
-                )
-            except Exception as structured_error:
-                # Some model/API combinations reject response schema settings. Retry once
-                # using ordinary text generation and a strict JSON-only prompt.
-                status_code = getattr(structured_error, "code", None) or getattr(structured_error, "status_code", None)
-                message = str(structured_error).lower()
-                likely_config_error = status_code in (400, 404, 422) or any(
-                    token in message for token in ("response_schema", "response_mime_type", "structured output", "not supported")
-                )
-                if not likely_config_error:
-                    raise
-                current_app.logger.warning(
-                    "Gemma JSON-schema mode was rejected (%s); retrying with strict JSON prompting.",
-                    type(structured_error).__name__,
-                )
-                structured_output_supported = False
-
-        return client.models.generate_content(
-            model=model_name,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.0,
-                max_output_tokens=5000,
-            ),
-        )
-
-    try:
-        response = generate_response(prompt)
-        output_text = _gemma_response_text(response)
-    except Exception as error:
-        current_app.logger.warning("Gemma request failed (%s).", type(error).__name__)
-        raise ApiProblem(
-            "Gemma couldn't generate the itinerary. Check GEMMA_API_KEY, GEMMA_MODEL, your API quota, and then retry.",
-            503,
-            "gemma_unavailable",
-        ) from error
-
-    model_plan: dict[str, Any] | None = None
-    parse_error: Exception | None = None
-    for attempt in range(2):
-        try:
-            model_plan = _parse_model_json(output_text)
-            if not isinstance(model_plan.get("days"), list):
-                raise ValueError("Gemma JSON did not contain a 'days' array")
-            break
-        except (ValueError, json.JSONDecodeError) as error:
-            model_plan = None
-            parse_error = error
-            if attempt == 0:
-                current_app.logger.warning(
-                    "Gemma itinerary output was not usable JSON (length=%d, preview=%r); retrying once.",
-                    len(output_text),
-                    output_text[:220],
-                )
-                retry_prompt = (
-                    prompt
-                    + "\n\nIMPORTANT RETRY: Your previous output could not be parsed. Output ONLY one valid JSON object. "
-                    + "The top-level keys must be exactly 'days' and 'general_tips'. Do not use markdown, comments, or trailing commas. "
-                    + "Use the candidate place_id strings verbatim. Keep the response concise so it is not cut off."
-                )
-                try:
-                    response = generate_response(retry_prompt)
-                    output_text = _gemma_response_text(response)
-                except Exception as retry_error:
-                    current_app.logger.warning("Gemma retry failed (%s).", type(retry_error).__name__)
-                    raise ApiProblem(
-                        "Gemma couldn't complete itinerary generation. Please retry in a moment.",
-                        503,
-                        "gemma_unavailable",
-                    ) from retry_error
-
-    if model_plan is None:
-        current_app.logger.warning(
-            "Gemma returned invalid itinerary JSON after retry (length=%d, parse_error=%s, preview=%r).",
-            len(output_text),
-            type(parse_error).__name__ if parse_error else "unknown",
-            output_text[:220],
-        )
-        raise ApiProblem(
-            "Gemma couldn't format the itinerary correctly after two attempts. Please retry generation.",
-            502,
-            "gemma_invalid_response",
-        )
-
-    raw_days = model_plan["days"]
-    day_map: dict[int, dict[str, Any]] = {}
-    used_ids: set[str] = set()
-    for raw_day in raw_days:
-        if not isinstance(raw_day, dict):
-            continue
-        try:
-            day_number = int(raw_day.get("day"))
-        except (TypeError, ValueError):
-            continue
-        if not 1 <= day_number <= plan["duration"] or day_number in day_map:
-            continue
-        raw_activities = raw_day.get("activities", [])
-        activities: list[dict[str, Any]] = []
-        if isinstance(raw_activities, list):
-            for item in raw_activities:
-                if not isinstance(item, dict):
-                    continue
-                place_id = str(item.get("place_id", ""))
-                place = candidates_by_id.get(place_id)
-                # Validate model-selected IDs and prevent repeats. The model cannot create factual place records.
-                if not place or place_id in used_ids:
-                    continue
-                used_ids.add(place_id)
-                try:
-                    visit_duration = int(item.get("duration_minutes", 90))
-                except (TypeError, ValueError):
-                    visit_duration = 90
-                visit_duration = max(30, min(180, visit_duration))
-                reason = item.get("reason")
-                if not isinstance(reason, str) or not reason.strip():
-                    reason = f"A potential match for your interests in {', '.join(plan['interests']) or 'local attractions'}. Verify details before visiting."
-                activities.append({
-                    "attraction_id": place["id"],
-                    "place_id": place["id"],
-                    "name": place["name"],
-                    "description": reason.strip()[:450],
-                    "category": place["category"],
-                    "estimated_cost": 0,
-                    "estimated_entry_fee_per_person": 0,
-                    "entry_fee_known": False,
-                    "visit_duration_minutes": visit_duration,
-                    "visit_duration_is_estimate": True,
-                    "planning_notes": "Check the official listing for opening hours, access rules, ticket prices, and temporary closures.",
-                    "address": place["address"],
-                    "latitude": place["latitude"],
-                    "longitude": place["longitude"],
-                    "rating": place["rating"],
-                    "maps_url": place["maps_url"],
-                    "provider": place["provider"],
-                    "costs_are_estimates": True,
-                })
-        day_theme = raw_day.get("theme")
-        note = raw_day.get("note")
-        day_obj: dict[str, Any] = {"day": day_number, "activities": activities}
-        if isinstance(day_theme, str) and day_theme.strip():
-            day_obj["theme"] = day_theme.strip()[:100]
-        if isinstance(note, str) and note.strip():
-            day_obj["note"] = note.strip()[:300]
-        elif not activities:
-            day_obj["note"] = "There aren't enough verified stops for this day. Keep it flexible rather than relying on invented places."
-        day_map[day_number] = day_obj
-
-    itinerary: list[dict[str, Any]] = []
-    for day_number in range(1, plan["duration"] + 1):
-        itinerary.append(day_map.get(day_number, {
-            "day": day_number,
-            "activities": [],
-            "note": "Gemma didn't return a plan for this day. Keep it flexible or regenerate the itinerary.",
-        }))
-
-    if len(used_ids) < 2:
-        raise ApiProblem("Gemma couldn't create a usable itinerary from the verified places returned. Try another destination or different interests.", 502, "gemma_no_usable_stops")
-    return itinerary
-
-
 def _estimate_budget(plan: dict[str, Any], itinerary: list[dict[str, Any]]) -> dict[str, Any]:
     """Very rough INR planning assumptions; never represent these as live prices."""
     person_days = plan["duration"] * plan["travelers"]
@@ -819,6 +1143,63 @@ def _estimate_budget(plan: dict[str, Any], itinerary: list[dict[str, Any]]) -> d
     }
 
 
+def _itinerary_for_storage(itinerary: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Store model recommendation text and verified coordinates; no provider billing key is needed to reopen it."""
+    stored_days: list[dict[str, Any]] = []
+    for day in itinerary:
+        activities = []
+        for activity in day.get("activities", []):
+            activities.append({
+                "place_id": str(activity.get("place_id") or activity.get("attraction_id") or ""),
+                "attraction_id": str(activity.get("attraction_id") or activity.get("place_id") or ""),
+                "name": str(activity.get("name") or "Place details unavailable")[:160],
+                "description": str(activity.get("description") or "")[:450],
+                "category": str(activity.get("category") or "Point of interest")[:100],
+                "address": str(activity.get("address") or "")[:300],
+                "latitude": activity.get("latitude"), "longitude": activity.get("longitude"),
+                "maps_url": str(activity.get("maps_url") or activity.get("map_url") or "")[:500],
+                "map_url": str(activity.get("map_url") or activity.get("maps_url") or "")[:500],
+                "provider": str(activity.get("provider") or "Gemma recommendation")[:120],
+                "rating": activity.get("rating"),
+                "visit_duration_minutes": max(30, min(180, int(activity.get("visit_duration_minutes", 90)))),
+                "visit_duration_is_estimate": True,
+                "estimated_cost": 0, "estimated_entry_fee_per_person": 0,
+                "entry_fee_known": False, "costs_are_estimates": True,
+                "planning_notes": str(activity.get("planning_notes") or "Verify current access, opening hours and prices before visiting.")[:500],
+                "recommendation_reason": str(activity.get("recommendation_reason") or activity.get("description") or "")[:450],
+            })
+        stored_days.append({"day": int(day.get("day", len(stored_days) + 1)),
+                            "theme": str(day.get("theme") or "")[:100],
+                            "note": str(day.get("note") or "")[:300],
+                            "travel_minutes_estimate": day.get("travel_minutes_estimate"),
+                            "travel_distance_km_estimate": day.get("travel_distance_km_estimate"),
+                            "route_time_source": day.get("route_time_source", "saved estimate"),
+                            "route_path": day.get("route_path", []), "activities": activities})
+    return stored_days
+
+
+def _hydrate_saved_trip(trip: dict[str, Any]) -> dict[str, Any]:
+    """Saved trips already include mapped coordinates, so reopening does not call a paid places API."""
+    for day in trip.get("itinerary", []):
+        for activity in day.get("activities", []):
+            if not activity.get("name"):
+                activity["name"] = "Saved stop details unavailable"
+                activity["planning_notes"] = "This older saved trip did not preserve the location coordinates. Generate a new trip to refresh it."
+            activity.setdefault("maps_url", activity.get("map_url", ""))
+            activity.setdefault("map_url", activity.get("maps_url", ""))
+            activity.setdefault("entry_fee_known", False)
+            activity.setdefault("visit_duration_is_estimate", True)
+            activity.setdefault("costs_are_estimates", True)
+    by_id = {
+        str(activity.get("place_id") or activity.get("attraction_id")): activity
+        for day in trip.get("itinerary", []) for activity in day.get("activities", [])
+        if (activity.get("place_id") or activity.get("attraction_id")) and activity.get("latitude") is not None and activity.get("longitude") is not None
+    }
+    if by_id:
+        _attach_open_route_paths(trip.get("itinerary", []), {"transport": trip.get("transport", "Flexible")}, by_id)
+    return trip
+
+
 def _trip_from_row(row: sqlite3.Row) -> dict[str, Any]:
     breakdown = json.loads(row["expense_breakdown"] or "{}")
     itinerary = json.loads(row["itinerary"] or "[]")
@@ -843,7 +1224,7 @@ def _trip_from_row(row: sqlite3.Row) -> dict[str, Any]:
 
 def _save_trip(plan: dict[str, Any]) -> dict[str, Any]:
     created_at = datetime.now(timezone.utc).isoformat()
-    planner_engine = str(plan.get("planner_engine") or f"Gemma ({os.getenv('GEMMA_MODEL', 'gemma-4-26b-a4b-it')}) + Geoapify Places")
+    planner_engine = str(plan.get("planner_engine") or f"Gemma ({os.getenv('GEMMA_MODEL', 'gemma-4-31b-it')}) + Geoapify geocoding + OpenStreetMap OSRM + OR-Tools")
     with _database_connection() as connection:
         cursor = connection.execute(
             """
@@ -856,7 +1237,7 @@ def _save_trip(plan: dict[str, Any]) -> dict[str, Any]:
                 plan["destination"], plan["duration"], plan["budget"], plan["travelers"],
                 plan["transport"], json.dumps(plan["interests"], ensure_ascii=False),
                 json.dumps(plan["budget_breakdown"], ensure_ascii=False),
-                json.dumps(plan["itinerary"], ensure_ascii=False), created_at, planner_engine,
+                json.dumps(_itinerary_for_storage(plan["itinerary"]), ensure_ascii=False), created_at, planner_engine,
             ),
         )
         trip_id = int(cursor.lastrowid)
@@ -922,7 +1303,9 @@ def create_app(config_overrides: dict[str, Any] | None = None) -> Flask:
                 "service": "RoamWise API",
                 "database": "connected",
                 "gemma_configured": bool(os.getenv("GEMMA_API_KEY", "").strip()),
-                "places_provider_configured": bool(os.getenv("GEOAPIFY_API_KEY", "").strip()),
+                "geoapify_key_configured": bool(os.getenv("GEOAPIFY_API_KEY", "").strip()),
+                "place_recommendation_engine": "Gemma",
+                "route_optimizer": "OR-Tools with exact small-day search; heuristic fallback",
             })
         except sqlite3.Error:
             current_app.logger.exception("SQLite health check failed")
@@ -943,102 +1326,31 @@ def create_app(config_overrides: dict[str, Any] | None = None) -> Flask:
 
     @app.get("/api/destination-suggestions")
     def destination_suggestions():
-        """Live destination autocomplete powered by Geoapify Geocoding."""
-        query = request.args.get("q", "").strip()
+        """Destination suggestions via Geoapify geocoding; no Google Maps API is used."""
+        query = request.args.get("q", "").strip()[:120]
         if len(query) < 2:
             return jsonify({"suggestions": []})
-
-        # Bound user input and results to keep autocomplete requests small.
-        query = query[:120]
-        api_key = _require_env("GEOAPIFY_API_KEY", "autocomplete destination names")
-        try:
-            response = requests.get(
-                GEOAPIFY_AUTOCOMPLETE_URL,
-                params={
-                    "text": query,
-                    "format": "json",
-                    "limit": 8,
-                    "lang": "en",
-                    "apiKey": api_key,
-                },
-                headers=_service_headers(),
-                timeout=(4, 10),
-            )
-        except requests.RequestException as error:
-            current_app.logger.warning(
-                "Geoapify autocomplete failed (%s).", type(error).__name__
-            )
-            raise ApiProblem(
-                "Destination autocomplete is temporarily unavailable. Check your connection and retry.",
-                503,
-                "autocomplete_network_error",
-            ) from error
-
-        if not response.ok:
-            raise _provider_error(response, "Geoapify autocomplete")
-
-        try:
-            payload = response.json()
-        except ValueError as error:
-            raise ApiProblem(
-                "The destination service returned an unreadable response.",
-                502,
-                "autocomplete_invalid_response",
-            ) from error
-
-        results = payload.get("results", []) if isinstance(payload, dict) else []
-        if not isinstance(results, list):
-            raise ApiProblem(
-                "The destination service returned an unexpected response.",
-                502,
-                "autocomplete_invalid_response",
-            )
-
+        api_key = _geoapify_key()
+        results = _geoapify_geocode(query, api_key, limit=8)
         suggestions: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for item in results:
-            if not isinstance(item, dict):
+        for result in results:
+            coords = _geo_result_coordinates(result)
+            label = _normalise_geo_label(str(result.get("formatted") or "").strip(), result)
+            if not coords or not label or label.casefold() in seen:
                 continue
-            label = str(item.get("formatted") or "").strip()
-            if not label:
-                continue
-            title = str(
-                item.get("name")
-                or item.get("city")
-                or item.get("town")
-                or item.get("village")
-                or item.get("state")
-                or item.get("country")
-                or label.split(",")[0]
-            ).strip()
-            dedupe_key = label.casefold()
-            if dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
-
-            try:
-                latitude = float(item["lat"]) if item.get("lat") is not None else None
-            except (TypeError, ValueError):
-                latitude = None
-            try:
-                longitude = float(item["lon"]) if item.get("lon") is not None else None
-            except (TypeError, ValueError):
-                longitude = None
-
+            seen.add(label.casefold())
+            title = str(result.get("name") or result.get("address_line1") or label.split(",")[0]).strip()
             suggestions.append({
-                "title": title,
-                "label": label,
-                "result_type": str(item.get("result_type") or "place"),
-                "city": item.get("city") or item.get("town") or item.get("village"),
-                "state": item.get("state"),
-                "country": item.get("country"),
-                "latitude": latitude,
-                "longitude": longitude,
+                "title": title, "label": label,
+                "result_type": str(result.get("result_type") or "location"),
+                "city": result.get("city"), "state": result.get("state"), "country": result.get("country"),
+                "latitude": coords[0], "longitude": coords[1], "place_id": result.get("place_id"),
             })
             if len(suggestions) >= 8:
                 break
-
         return jsonify({"suggestions": suggestions, "count": len(suggestions)})
+
 
     @app.post("/api/plan")
     def create_plan():
@@ -1049,32 +1361,31 @@ def create_app(config_overrides: dict[str, Any] | None = None) -> Flask:
             raise ApiProblem("Request body contains invalid JSON.", 400, "invalid_json")
 
         plan_request = _validate_plan(payload)
-        # Check both keys before spending time or place-search credits on a plan that cannot be completed.
-        _require_env("GEMMA_API_KEY", "generate personalized itineraries")
-        _require_env("GEOAPIFY_API_KEY", "search real places and resolve destinations")
-        places, resolved_destination = discover_places(plan_request["destination"], plan_request["interests"])
-        ranked_places = _rank_places(places, plan_request["interests"])
-        sight_count = sum(
-            1 for place in ranked_places
-            if any(str(category).startswith(SIGHT_CATEGORY_PREFIXES) for category in (place.get("categories") or []))
-        )
-        minimum_sights = max(MIN_VERIFIED_SIGHT_COUNT, min(plan_request["duration"], 5))
-        if sight_count < minimum_sights:
-            raise ApiProblem(
-                f"RoamWise doesn't have enough verified tourist-place data for {plan_request['destination']} right now. Try a better-known nearby city or another destination.",
-                422,
-                "destination_not_available",
-            )
-        itinerary = _generate_gemma_itinerary(plan_request, ranked_places, resolved_destination)
+        _require_env("GEMMA_API_KEY", "recommend real visitor places and optimize the itinerary")
+        _require_env("GEOAPIFY_API_KEY", "resolve the destination and suggested places to coordinates")
+
+        # Gemma chooses attractions/activity areas. Geoapify only resolves those names to map coordinates.
+        all_places, resolved_destination, center = _discover_gemma_places(plan_request)
+        # Do not fail the whole trip just because the geocoder verified fewer than
+        # three suggestions. The itinerary builder can use one verified stop and
+        # explicitly mark any remaining days as under-filled instead of returning 422.
+
+        candidates = _rank_places(all_places, plan_request["interests"])[:MAX_CANDIDATES_FOR_ROUTING]
+        route_matrix, route_source = _compute_route_matrix(candidates, plan_request["transport"])
+        itinerary = _generate_gemma_itinerary(plan_request, candidates, resolved_destination, route_matrix, route_source)
+        by_id = {str(place["id"]): place for place in candidates}
+        _attach_open_route_paths(itinerary, plan_request, by_id)
         breakdown = _estimate_budget(plan_request, itinerary)
         plan = {
             **plan_request,
             "itinerary": itinerary,
             "budget_breakdown": breakdown,
-            "planner_engine": f"Gemma ({os.getenv('GEMMA_MODEL', 'gemma-4-26b-a4b-it')}) + Geoapify Places",
+            "planner_engine": f"Gemma ({os.getenv('GEMMA_MODEL', 'gemma-4-31b-it')}) recommendations + Geoapify geocoding + OpenStreetMap OSRM + open route optimization ({route_source})",
         }
         trip = _save_trip(plan)
+        trip["itinerary"] = itinerary
         return jsonify({"trip": trip}), 201
+
 
     @app.get("/api/trips")
     def list_saved_trips():
@@ -1101,7 +1412,7 @@ def create_app(config_overrides: dict[str, Any] | None = None) -> Flask:
             row = connection.execute("SELECT * FROM trips WHERE id = ?", (trip_id,)).fetchone()
         if row is None:
             raise ApiProblem("Saved trip not found.", 404, "not_found")
-        return jsonify({"trip": _trip_from_row(row)})
+        return jsonify({"trip": _hydrate_saved_trip(_trip_from_row(row))})
 
     @app.delete("/api/trips/<int:trip_id>")
     def delete_saved_trip(trip_id: int):
