@@ -9,6 +9,7 @@ import {
   ChevronDown,
   ChevronUp,
   Compass,
+  Download,
   MapPin,
   LoaderCircle,
   LocateFixed,
@@ -493,7 +494,10 @@ function ItineraryMap({ destination, itinerary }: { destination: string; itinera
         }
         if (!cancelled) setRouteStatus(routesLoaded === 0 ? 'unavailable' : failures > 0 ? 'partial' : 'ready')
       } catch {
-        if (!cancelled) setMapError(true)
+        if (!cancelled) {
+          setMapError(true)
+          setRouteStatus('unavailable')
+        }
       }
     }
     void initialize()
@@ -504,6 +508,31 @@ function ItineraryMap({ destination, itinerary }: { destination: string; itinera
       mapBoundsRef.current = null
     }
   }, [stops, itinerary])
+
+  // Leaflet recalculates its viewport when the print layout narrows the map.
+  useEffect(() => {
+    const refreshSelectedMapForPrint = () => {
+      const requestedTarget = document.body.getAttribute('data-roamwise-pdf-target')
+      const element = mapElementRef.current
+      if (!requestedTarget || !element) return
+      const resultSection = element.closest('#generated-itinerary, #active-exploration-route')
+      const mapTarget = resultSection?.id === 'generated-itinerary'
+        ? 'itinerary'
+        : resultSection?.id === 'active-exploration-route'
+          ? 'exploration'
+          : null
+      if (mapTarget !== requestedTarget) return
+      const currentMap = mapInstanceRef.current
+      const currentBounds = mapBoundsRef.current
+      if (!currentMap) return
+      currentMap.invalidateSize({ pan: false })
+      if (currentBounds?.isValid()) {
+        currentMap.fitBounds(currentBounds, { padding: [38, 38], maxZoom: 13, animate: false })
+      }
+    }
+    window.addEventListener('beforeprint', refreshSelectedMapForPrint)
+    return () => window.removeEventListener('beforeprint', refreshSelectedMapForPrint)
+  }, [])
 
   if (stops.length === 0 || mapError) {
     return (
@@ -518,13 +547,13 @@ function ItineraryMap({ destination, itinerary }: { destination: string; itinera
   const days = Array.from(new Set(stops.map(stop => stop.day)))
   return (
     <div className="relative h-[320px] w-full bg-[#0a1d2a] sm:h-[390px] lg:h-[440px]">
-      <div ref={mapElementRef} className="h-full w-full" aria-label={`Interactive itinerary map for ${destination}`} />
+      <div ref={mapElementRef} data-route-status={routeStatus} className="h-full w-full" aria-label={`Interactive itinerary map for ${destination}`} />
       <button
         type="button"
         onClick={recenterMap}
         title="Show all places"
         aria-label="Recenter map to show all places and route"
-        className="absolute right-3 top-[60px] z-[500] grid h-11 w-11 place-items-center rounded-xl border border-white/15 bg-[#071522]/95 text-[#8AECDD] shadow-xl backdrop-blur transition hover:border-[#57DCC6]/60 hover:bg-[#0E2A38] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#57DCC6]"
+        className="pdf-hide absolute right-3 top-[60px] z-[500] grid h-11 w-11 place-items-center rounded-xl border border-white/15 bg-[#071522]/95 text-[#8AECDD] shadow-xl backdrop-blur transition hover:border-[#57DCC6]/60 hover:bg-[#0E2A38] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#57DCC6]"
       >
         <LocateFixed size={19} aria-hidden="true" />
       </button>
@@ -678,6 +707,8 @@ export default function Home() {
   const [apiDestinations, setApiDestinations] = useState<ApiDestination[]>([])
   const [exploreDestinations, setExploreDestinations] = useState<ApiDestination[]>([])
   const [exploreError, setExploreError] = useState<string | null>(null)
+  const [hasLoadedExploreDestinations, setHasLoadedExploreDestinations] = useState(false)
+  const [successfulExploreQuery, setSuccessfulExploreQuery] = useState<string | null>(null)
   const [isSearching, setIsSearching] = useState(false)
   const [trip, setTrip] = useState<Trip | null>(null)
   const [planError, setPlanError] = useState<string | null>(null)
@@ -698,6 +729,7 @@ export default function Home() {
   const [savedExplorationRoutesExpanded, setSavedExplorationRoutesExpanded] = useState(false)
   const [savedExplorationRoutesError, setSavedExplorationRoutesError] = useState<string | null>(null)
   const [deletingExplorationRouteId, setDeletingExplorationRouteId] = useState<number | null>(null)
+  const [pdfPreparing, setPdfPreparing] = useState<'itinerary' | 'exploration' | null>(null)
   const appRootRef = useRef<HTMLElement>(null)
   const spotlightRef = useRef<HTMLDivElement>(null)
 
@@ -739,6 +771,7 @@ export default function Home() {
         if (!active) return
         setApiDestinations(items)
         setExploreDestinations(items)
+        setHasLoadedExploreDestinations(true)
       })
       .catch(() => {
         // The Explore screen identifies its intentional local visual fallback.
@@ -747,16 +780,24 @@ export default function Home() {
   }, [])
 
   useEffect(() => {
-    if (view !== 'explore') return
+    if (view !== 'explore') {
+      setIsSearching(false)
+      return
+    }
     const controller = new AbortController()
+    // Show a loading state immediately; only debounce the network request.
+    setIsSearching(true)
+    setExploreError(null)
+    setSuccessfulExploreQuery(null)
     const timer = window.setTimeout(async () => {
-      setIsSearching(true)
       try {
         // The client owns the request lifetime; API errors retain a readable fallback.
         const items = await searchDestinations(search, controller.signal)
         if (!controller.signal.aborted) {
           setExploreDestinations(items)
           setExploreError(null)
+          setHasLoadedExploreDestinations(true)
+          setSuccessfulExploreQuery(search.trim())
         }
       } catch (error) {
         if (!controller.signal.aborted) {
@@ -948,8 +989,8 @@ export default function Home() {
   }, [search])
 
   const filteredDestinations = useMemo(
-    () => (exploreError ? fallbackSearchResults : exploreDestinations.map(toDestinationCard)),
-    [exploreDestinations, exploreError, fallbackSearchResults],
+    () => (exploreError || isSearching || !hasLoadedExploreDestinations ? fallbackSearchResults : exploreDestinations.map(toDestinationCard)),
+    [exploreDestinations, exploreError, fallbackSearchResults, hasLoadedExploreDestinations, isSearching],
   )
 
 
@@ -1019,6 +1060,62 @@ export default function Home() {
 
   const budgetMin = budgetCurrency === 'INR' ? 500 : Math.max(1, Math.ceil((500 / (usdInrRate || 87)) * 100) / 100)
   const budgetMax = budgetCurrency === 'INR' ? 100000 : Math.floor((100000 / (usdInrRate || 87)) * 100) / 100
+
+  const downloadResultPdf = async (target: 'itinerary' | 'exploration') => {
+    if (target === 'itinerary' && !trip) return
+    if (target === 'exploration' && !activeExplorationRoute) return
+
+    const sectionId = target === 'itinerary' ? 'generated-itinerary' : 'active-exploration-route'
+    const section = document.getElementById(sectionId)
+    if (!section) return
+
+    const originalTitle = document.title
+    const originalTarget = document.body.getAttribute('data-roamwise-pdf-target')
+    const titleSubject = target === 'itinerary'
+      ? `${trip!.destination} - ${trip!.duration}-day itinerary`
+      : `${activeExplorationRoute!.destination} - extra places route`
+    let restored = false
+    const restorePrintState = () => {
+      if (restored) return
+      restored = true
+      document.title = originalTitle
+      if (originalTarget === null) document.body.removeAttribute('data-roamwise-pdf-target')
+      else document.body.setAttribute('data-roamwise-pdf-target', originalTarget)
+      window.removeEventListener('afterprint', restorePrintState)
+      setPdfPreparing(null)
+    }
+
+    setPdfPreparing(target)
+    document.body.setAttribute('data-roamwise-pdf-target', target)
+    document.title = `RoamWise - ${titleSubject}`
+    window.addEventListener('afterprint', restorePrintState)
+
+    try {
+      // Give the Leaflet map time to finish drawing its route before the print snapshot.
+      const routeDeadline = Date.now() + 15000
+      while (Date.now() < routeDeadline && section.querySelector('[data-route-status="loading"]')) {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 150))
+      }
+
+      // Wait briefly for current map tiles and other images. A failed tile should not block export.
+      const pendingImages = Array.from(section.querySelectorAll('img')).filter((image) => !image.complete)
+      if (pendingImages.length > 0) {
+        await Promise.race([
+          Promise.all(pendingImages.map((image) => new Promise<void>((resolve) => {
+            image.addEventListener('load', () => resolve(), { once: true })
+            image.addEventListener('error', () => resolve(), { once: true })
+          }))),
+          new Promise<void>((resolve) => window.setTimeout(resolve, 5000)),
+        ])
+      }
+      await new Promise<void>((resolve) => window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve())))
+      window.print()
+    } catch {
+      window.alert('The PDF could not be prepared. Wait for the map to load, then try again.')
+    } finally {
+      window.setTimeout(restorePrintState, 1200)
+    }
+  }
 
   const generateItinerary = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -1176,6 +1273,61 @@ export default function Home() {
 
   return (
     <main ref={appRootRef} className="relative min-h-screen overflow-hidden bg-[#071522] text-[#ECF5FC] selection:bg-[#57DCC6]/30 selection:text-white">
+    <style>{`
+      @page { size: A4 portrait; margin: 10mm; }
+      @media print {
+        html, body { background: #071522 !important; margin: 0 !important; overflow: visible !important; }
+        body * { visibility: hidden !important; }
+        header { display: none !important; }
+        main { position: static !important; min-height: 0 !important; height: auto !important; overflow: visible !important; }
+        main > section { display: none !important; }
+        main > #plan-view { display: block !important; position: static !important; width: 100% !important; max-width: none !important; min-height: 0 !important; margin: 0 !important; padding: 0 !important; overflow: visible !important; }
+        #plan-view > * { display: none !important; }
+        #generated-itinerary, #active-exploration-route { display: none !important; }
+        body[data-roamwise-pdf-target="itinerary"] #generated-itinerary,
+        body[data-roamwise-pdf-target="itinerary"] #generated-itinerary *,
+        body[data-roamwise-pdf-target="exploration"] #active-exploration-route,
+        body[data-roamwise-pdf-target="exploration"] #active-exploration-route * { visibility: visible !important; }
+        body[data-roamwise-pdf-target="itinerary"] #generated-itinerary,
+        body[data-roamwise-pdf-target="exploration"] #active-exploration-route {
+          display: block !important;
+          position: absolute !important;
+          top: 0 !important;
+          left: 0 !important;
+          width: 100% !important;
+          max-width: none !important;
+          margin: 0 !important;
+          overflow: visible !important;
+          box-shadow: none !important;
+          -webkit-print-color-adjust: exact !important;
+          print-color-adjust: exact !important;
+        }
+        #generated-itinerary [data-pdf-exclude="true"],
+        #active-exploration-route [data-pdf-exclude="true"],
+        #generated-itinerary .pdf-hide,
+        #active-exploration-route .pdf-hide { display: none !important; }
+        #generated-itinerary .itinerary-days-grid { grid-template-columns: minmax(0, 1fr) !important; }
+        #active-exploration-route .exploration-place-grid { grid-template-columns: minmax(0, 1fr) !important; }
+        #generated-itinerary article, #active-exploration-route article {
+          break-inside: avoid !important;
+          page-break-inside: avoid !important;
+          box-shadow: none !important;
+        }
+        #generated-itinerary .leaflet-container,
+        #active-exploration-route .leaflet-container {
+          height: 360px !important;
+          min-height: 360px !important;
+          max-height: none !important;
+          break-inside: avoid !important;
+          page-break-inside: avoid !important;
+          -webkit-print-color-adjust: exact !important;
+          print-color-adjust: exact !important;
+        }
+        #generated-itinerary .leaflet-control-zoom,
+        #active-exploration-route .leaflet-control-zoom { display: none !important; }
+        #generated-itinerary a, #active-exploration-route a { text-decoration: none !important; }
+      }
+    `}</style>
       <div className="pointer-events-none absolute inset-0 z-0 overflow-hidden" aria-hidden="true">
         <div
           ref={spotlightRef}
@@ -1345,19 +1497,19 @@ export default function Home() {
                 </article>
               ))}
             </div>
-          ) : (
+          ) : !isSearching && hasLoadedExploreDestinations && successfulExploreQuery === search.trim() && !exploreError ? (
             <div className="mt-12 rounded-2xl border border-dashed border-[#35566A] bg-[#0C2232]/60 p-10 text-center text-sm text-[#A8BECE]">
               <p>No curated Explore cards match “{search}”. You can still plan any destination with Gemma's recommendations.</p>
               <button type="button" onClick={() => openPlanner(search.trim())} className="mt-4 inline-flex items-center gap-2 rounded-full border border-[#57DCC6]/30 bg-[#123B45] px-4 py-2.5 text-sm font-semibold text-[#83EAD9] transition hover:bg-[#174A55]">
                 Plan {search.trim() ? `a trip to ${search.trim()}` : 'a trip'} <ArrowRight size={15} />
               </button>
             </div>
-          )}
+          ) : null}
         </section>
       )}
 
       {view === 'plan' && (
-        <section className="relative z-10 mx-auto min-h-[calc(100svh-73px)] w-full max-w-6xl min-w-0 px-4 py-6 sm:px-6 sm:py-9 lg:px-8 lg:py-12">
+        <section id="plan-view" className="relative z-10 mx-auto min-h-[calc(100svh-73px)] w-full max-w-6xl min-w-0 px-4 py-6 sm:px-6 sm:py-9 lg:px-8 lg:py-12">
           <button type="button" onClick={() => window.history.back()} className="inline-flex items-center gap-2 text-sm font-semibold text-[#9BB2C2] transition hover:text-[#78E7D4]">
             <ArrowLeft size={16} /> Back
           </button>
@@ -1627,7 +1779,7 @@ export default function Home() {
           </form>
 
           {trip && (
-            <section aria-live="polite" className="mt-6 overflow-hidden rounded-3xl border border-[#2B5967] bg-[#0A202D] shadow-[0_22px_70px_rgba(0,0,0,0.22)]">
+            <section id="generated-itinerary" aria-live="polite" className="mt-6 overflow-hidden rounded-3xl border border-[#2B5967] bg-[#0A202D] shadow-[0_22px_70px_rgba(0,0,0,0.22)]">
               <div className="p-5 sm:p-7">
                 <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-start">
                   <div>
@@ -1635,6 +1787,10 @@ export default function Home() {
                     <h2 className="mt-2 text-2xl font-extrabold tracking-tight text-white sm:text-3xl">{trip.destination} · {trip.duration} {trip.duration === 1 ? 'day' : 'days'}</h2>
                     <p className="mt-2 text-sm text-[#B4C7D6]">{trip.travelers} {trip.travelers === 1 ? 'traveler' : 'travelers'} <span className="mx-1 text-[#55778A]">·</span> {trip.transport} <span className="mx-1 text-[#55778A]">·</span> {formatBudgetCurrency(trip.budget_input_amount ?? trip.budget, trip.budget_currency ?? 'INR')} group budget{trip.budget_currency === 'USD' ? ` (≈ ${formatINR(trip.budget)})` : ''}</p>
                   </div>
+                  <button type="button" onClick={() => void downloadResultPdf('itinerary')} disabled={pdfPreparing !== null} className="pdf-hide inline-flex shrink-0 items-center justify-center gap-2 self-start rounded-xl border border-[#57DCC6]/40 bg-[#123B45] px-4 py-2.5 text-sm font-bold text-[#8AECDD] transition hover:border-[#57DCC6]/70 hover:bg-[#174A55] disabled:cursor-wait disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#57DCC6]">
+                    <Download size={16} aria-hidden="true" />
+                    {pdfPreparing === 'itinerary' ? 'Preparing PDF…' : 'Download PDF'}
+                  </button>
                 </div>
 
                 <div className="mt-6 overflow-hidden rounded-2xl border border-[#29485C] bg-[#081B28]">
@@ -1656,7 +1812,7 @@ export default function Home() {
                   
                 </div>
 
-                <section className="mt-7 overflow-hidden rounded-2xl border border-[#2B5967] bg-gradient-to-br from-[#0D2938] to-[#081B28]" aria-labelledby="other-places-title">
+                <section data-pdf-exclude="true" className="mt-7 overflow-hidden rounded-2xl border border-[#2B5967] bg-gradient-to-br from-[#0D2938] to-[#081B28]" aria-labelledby="other-places-title">
                   <div className="border-b border-[#29485C] p-4 sm:p-5">
                     <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                       <div className="min-w-0">
@@ -1731,7 +1887,7 @@ export default function Home() {
                   <span className="hidden rounded-full border border-[#29485C] px-3 py-1.5 text-xs text-[#A8BECE] sm:inline-flex">{trip.itinerary.reduce((sum, day) => sum + day.activities.length, 0)} planned stops</span>
                 </div>
 
-                <div className="mt-4 grid gap-4 lg:grid-cols-2">
+                <div className="itinerary-days-grid mt-4 grid gap-4 lg:grid-cols-2">
                   {trip.itinerary.map((day, dayIndex) => (
                     <article key={day.day} className="group rounded-2xl border border-[#29485C] bg-[#0B1C29] p-5 transition duration-200 hover:border-[#57DCC6]/40 hover:bg-[#0D2331] sm:p-6">
                       <div className="flex items-center justify-between gap-3">
@@ -1786,7 +1942,13 @@ export default function Home() {
                   <h2 className="mt-2 text-xl font-extrabold text-white sm:text-2xl">{activeExplorationRoute.title || `Extra places near ${activeExplorationRoute.destination}`}</h2>
                   <p className="mt-2 text-sm leading-6 text-[#AFC4D3]">{activeExplorationRoute.places.length} selected stops · starts at the destination center · the main itinerary is unchanged.</p>
                 </div>
-                <button type="button" onClick={() => setActiveExplorationRoute(null)} className="self-start rounded-full border border-[#29485C] px-3 py-2 text-xs font-semibold text-[#B4C7D6] transition hover:border-[#57DCC6]/45 hover:text-white">Close route preview</button>
+                <div className="pdf-hide flex shrink-0 flex-wrap items-center gap-2">
+                  <button type="button" onClick={() => void downloadResultPdf('exploration')} disabled={pdfPreparing !== null} className="inline-flex items-center justify-center gap-2 rounded-xl border border-[#57DCC6]/40 bg-[#123B45] px-3 py-2 text-xs font-bold text-[#8AECDD] transition hover:border-[#57DCC6]/70 hover:bg-[#174A55] disabled:cursor-wait disabled:opacity-60">
+                    <Download size={15} aria-hidden="true" />
+                    {pdfPreparing === 'exploration' ? 'Preparing PDF…' : 'Download PDF'}
+                  </button>
+                  <button type="button" onClick={() => setActiveExplorationRoute(null)} className="rounded-full border border-[#29485C] px-3 py-2 text-xs font-semibold text-[#B4C7D6] transition hover:border-[#57DCC6]/45 hover:text-white">Close route preview</button>
+                </div>
               </div>
               <div className="px-4 pt-4 sm:px-6">
                 <div className="flex flex-wrap gap-2">
@@ -1812,7 +1974,7 @@ export default function Home() {
                 }]} />
                 <p className="border-t border-[#29485C] px-4 py-3 text-[11px] leading-5 text-[#7898AC]">{activeExplorationRoute.route_path_source}. Route duration and distances are estimates, not live navigation. Map tiles © OpenStreetMap contributors.</p>
               </div>
-              <div className="grid gap-3 p-4 pt-0 sm:grid-cols-2 sm:p-6 sm:pt-0 lg:grid-cols-3">
+              <div className="exploration-place-grid grid gap-3 p-4 pt-0 sm:grid-cols-2 sm:p-6 sm:pt-0 lg:grid-cols-3">
                 {activeExplorationRoute.places.map((place, index) => (
                   <article key={`${activeExplorationRoute.id}-${place.place_id || place.attraction_id}-${index}`} className="rounded-xl border border-[#29485C] bg-[#081B28] p-4">
                     <div className="flex items-start gap-3">
