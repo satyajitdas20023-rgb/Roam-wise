@@ -379,7 +379,7 @@ def _geoapify_geocode(text: str, api_key: str, center: tuple[float, float] | Non
     last_network_error: Exception | None = None
     for attempt in range(2):
         try:
-            response = requests.get(GEOAPIFY_GEOCODE_URL, params=params, headers=_service_headers(), timeout=(5, 15))
+            response = requests.get(GEOAPIFY_GEOCODE_URL, params=params, headers=_service_headers(), timeout=(3, 8))
             if response.status_code < 500 or attempt == 1:
                 break
             current_app.logger.warning("Geoapify geocoding returned HTTP %s; retrying once.", response.status_code)
@@ -531,7 +531,7 @@ def _generate_gemma_place_recommendations(
     exclude_names: list[str] | None = None,
 ) -> list[dict[str, str]]:
     """Gemma is the recommender. In fallback mode, broaden to popular local sights matching interests."""
-    count = 16 if broaden_to_popular else min(20, max(10, plan["duration"] * 4 + len(plan["interests"])))
+    count = 12 if broaden_to_popular else min(20, max(10, plan["duration"] * 4 + len(plan["interests"])))
     schema = {
         "type": "OBJECT", "required": ["places"],
         "properties": {"places": {"type": "ARRAY", "items": {"type": "OBJECT",
@@ -562,7 +562,7 @@ For each place, return:
 - area: local neighbourhood/road/town name that helps resolve it geographically
 
 Only use locations that are genuinely in or reasonably near the named destination. Never invent exact addresses, coordinates or activity availability. Return JSON only: {{"places":[{{"name":"...","category":"...","reason":"...","area":"..."}}]}}."""
-    response = _call_gemma_json(prompt, schema, "popular-place fallback" if broaden_to_popular else "place recommendations", max_tokens=3000 if broaden_to_popular else 2400)
+    response = _call_gemma_json(prompt, schema, "popular-place fallback" if broaden_to_popular else "place recommendations", max_tokens=1800 if broaden_to_popular else 2400)
     raw_places = response.get("places", [])
     if not isinstance(raw_places, list):
         raise ApiProblem("Gemma did not return a valid place recommendation list. Please retry.", 502, "gemma_invalid_response")
@@ -703,7 +703,7 @@ def _resolve_gemma_recommendations(
 
 def _resolve_gemma_recommendations_parallel(
     recommendations: list[dict[str, str]], plan: dict[str, Any], resolved_destination: str,
-    latitude: float, longitude: float, api_key: str, max_workers: int = 4,
+    latitude: float, longitude: float, api_key: str, max_workers: int = 6,
 ) -> tuple[list[str], int, dict[str, dict[str, Any]]]:
     """Resolve independent recommendation names concurrently, preserving model order.
 
@@ -725,8 +725,8 @@ def _resolve_gemma_recommendations_parallel(
     if len(recommendations) <= 1:
         results = [resolve_one(item) for item in recommendations]
     else:
-        # Four concurrent lookups speeds up the usual 10-place pass without
-        # flooding Geoapify with a large burst of requests.
+        # Six concurrent lookups shorten I/O-bound place verification while keeping
+        # request volume bounded for Geoapify.
         with ThreadPoolExecutor(max_workers=min(max_workers, len(recommendations))) as pool:
             results = list(pool.map(resolve_one, recommendations))
 
@@ -1012,7 +1012,7 @@ def _compute_route_matrix(places: list[dict[str, Any]], transport: str) -> tuple
     if base and size >= 2:
         coords = ";".join(f"{float(p['longitude'])},{float(p['latitude'])}" for p in places)
         try:
-            response = _osrm_get(f"{base}/table/v1/driving/{coords}", params={"annotations": "duration,distance"}, timeout=(2, 8))
+            response = _osrm_get(f"{base}/table/v1/driving/{coords}", params={"annotations": "duration,distance"}, timeout=(2, 5))
             if response.ok:
                 payload = response.json()
                 durations = payload.get("durations") if isinstance(payload, dict) else None
@@ -1347,7 +1347,7 @@ def _attach_open_route_paths(
                 response = _osrm_get(
                     f"{route_base}/route/v1/driving/{coordinates}",
                     params={"overview": "full", "geometries": "geojson", "steps": "false"},
-                    timeout=(2, 7),
+                    timeout=(2, 4),
                 )
                 if not response.ok:
                     current_app.logger.warning("OSRM route geometry provider returned HTTP %s for day %s.", response.status_code, day.get("day"))
