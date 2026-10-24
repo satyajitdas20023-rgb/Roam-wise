@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: roamwise-api
+    runtime: python
+    rootDir: backend
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --bind 0.0.0.0:$PORT 'app:create_app()'
+    healthCheckPath: /api/health
+    envVars:
+      - key: GEMMA_API_KEY
+        sync: false
+      - key: GEOAPIFY_API_KEY
+        sync: false
+      - key: GEMMA_MODEL
+        value: gemma-4-31b-it
+      - key: CORS_ORIGINS
+        sync: false
+
+  - type: web
+    name: roamwise-frontend
+    runtime: node
+    rootDir: .
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NEXT_PUBLIC_API_BASE_URL
+        sync: false

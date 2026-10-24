@@ -11,7 +11,6 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from app import create_app
-from extensions import db
 
 
 @pytest.fixture()
@@ -20,15 +19,11 @@ def app(tmp_path):
     app = create_app(
         {
             "TESTING": True,
-            "SQLALCHEMY_DATABASE_URI": f"sqlite:///{database_path.as_posix()}",
+            "DATABASE_PATH": str(database_path),
             "CORS_ORIGINS": ("http://localhost:3000",),
-            "SEED_DATA": True,
         }
     )
     yield app
-    with app.app_context():
-        db.session.remove()
-        db.drop_all()
 
 
 @pytest.fixture()
