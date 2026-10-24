@@ -159,7 +159,7 @@ async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
       headers: { Accept: 'application/json', ...init?.headers },
     })
   } catch {
-    throw new ApiError('RoamWise could not reach the Flask backend. Start it and try again.', 0)
+    throw new ApiError('Server issue, Please try again after a bit!', 0)
   }
   const payload = await response.json().catch(() => null) as T | ApiErrorPayload | null
   if (!response.ok) {
