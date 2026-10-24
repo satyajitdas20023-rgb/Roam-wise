@@ -561,7 +561,7 @@ function ItineraryMap({ destination, itinerary }: { destination: string; itinera
         {days.map(day => <span key={day} className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-[#071522]/90 px-3 py-1.5 text-[11px] font-bold text-white shadow-lg backdrop-blur"><span className="h-2 w-2 rounded-full" style={{ backgroundColor: MAP_DAY_COLORS[(day - 1) % MAP_DAY_COLORS.length] }} />DAY {day}</span>)}
       </div>
       <div className="absolute right-3 top-3 z-[400] max-w-[245px] rounded-lg border border-white/10 bg-[#071522]/90 px-3 py-2 text-[11px] leading-4 text-[#D5E5EF] shadow-lg backdrop-blur">
-        {routeStatus === 'loading' ? 'Finding road routes…' : routeStatus === 'ready' ? (itinerary.some((day) => day.route_path_source?.toLowerCase().includes('destination center')) ? 'OSRM route preview · single-stop days start at the destination center' : 'Road routes via OSRM · driving-route preview') : routeStatus === 'partial' ? (itinerary.some((day) => day.route_path_source?.toLowerCase().includes('straight-line')) ? 'Dashed lines are approximate; road routing was unavailable.' : 'Some road routes are unavailable; markers remain visible.') : 'Road routing unavailable. Showing place markers.'}
+        {routeStatus === 'loading' ? 'Finding road routes…' : routeStatus === 'ready' ? (itinerary.some((day) => day.route_path_source?.toLowerCase().includes('destination center')) ? 'OSRM route preview · single-stop days start at the destination center' : 'Road routes via OSRM · driving-route preview') : routeStatus === 'partial' ? (itinerary.some((day) => day.route_path_source?.toLowerCase().includes('sample route')) ? 'Sample path preview · dashed lines are illustrative, not driving directions.' : itinerary.some((day) => day.route_path_source?.toLowerCase().includes('straight-line')) ? 'Dashed lines are approximate; road routing was unavailable.' : 'Some road routes are unavailable; markers remain visible.') : 'Road routing unavailable. Showing place markers.'}
       </div>
       {stops.length < activityCount && <div className="absolute bottom-14 right-3 z-[400] max-w-[230px] rounded-lg border border-amber-200/20 bg-[#071522]/90 px-3 py-2 text-[11px] leading-4 text-amber-100 shadow-lg backdrop-blur">Showing {stops.length} of {activityCount} stops. Some old saved attractions have no coordinates.</div>}
     </div>
@@ -668,6 +668,104 @@ const fallbackDestinations: DestinationCard[] = [
 
 const interestOptions = ['Nature', 'History', 'Local food', 'Adventure', 'Photography', 'Popular / hot']
 
+const SAMPLE_TRIP_ID = -20261024
+
+function createSampleActivity(
+  id: string,
+  name: string,
+  description: string,
+  category: string,
+  latitude: number,
+  longitude: number,
+  visitDurationMinutes: number,
+): Activity {
+  const mapUrl = `https://www.openstreetmap.org/?mlat=${latitude}&mlon=${longitude}#map=16/${latitude}/${longitude}`
+  return {
+    attraction_id: `sample-${id}`,
+    place_id: `sample-${id}`,
+    name,
+    description,
+    category,
+    estimated_cost: 0,
+    estimated_entry_fee_per_person: 0,
+    entry_fee_known: false,
+    visit_duration_minutes: visitDurationMinutes,
+    visit_duration_is_estimate: true,
+    planning_notes: 'Preloaded demonstration data. Verify current opening hours, access rules and entry fees before visiting.',
+    address: 'New Delhi, Delhi, India',
+    latitude,
+    longitude,
+    lat: latitude,
+    lng: longitude,
+    maps_url: mapUrl,
+    provider: 'RoamWise preloaded sample',
+    costs_are_estimates: true,
+  }
+}
+
+// Preloaded demo data lets reviewers explore the existing result UI immediately.
+// It is intentionally labelled as a sample; it is not a live Gemma API response.
+const SAMPLE_NEW_DELHI_TRIP: Trip = {
+  id: SAMPLE_TRIP_ID,
+  destination: 'New Delhi, India',
+  duration: 2,
+  budget: 12000,
+  budget_currency: 'INR',
+  budget_input_amount: 12000,
+  budget_exchange_rate: null,
+  travelers: 2,
+  transport: 'Flexible',
+  interests: ['History', 'Local food', 'Photography', 'Nature', 'Popular / hot'],
+  planner_engine: 'RoamWise preloaded demo sample (not a live Gemma response)',
+  created_at: '2026-10-24T00:00:00.000Z',
+  itinerary: [
+    {
+      day: 1,
+      theme: "India Gate & Lutyens' Delhi",
+      note: 'A mix of memorials, Mughal heritage and green space. Order and travel estimates are illustrative.',
+      activities: [
+        createSampleActivity('india-gate', 'India Gate', 'Begin at the iconic war memorial and walk around the surrounding lawns.', 'Memorial & landmark', 28.6129, 77.2296, 45),
+        createSampleActivity('national-war-memorial', 'National War Memorial', "Visit the nearby memorial honouring India's armed forces.", 'Memorial & history', 28.6128, 77.2344, 45),
+        createSampleActivity('humayuns-tomb', "Humayun's Tomb", 'Explore the Mughal garden-tomb complex and its distinctive architecture.', 'Heritage site', 28.5933, 77.2507, 90),
+        createSampleActivity('lodhi-garden', 'Lodhi Garden', 'Finish with a relaxed walk through landscaped gardens dotted with historic tombs.', 'Garden & heritage', 28.5931, 77.2197, 60),
+      ],
+      route_path: [
+        { latitude: 28.6129, longitude: 77.2296 },
+        { latitude: 28.6128, longitude: 77.2344 },
+        { latitude: 28.5933, longitude: 77.2507 },
+        { latitude: 28.5931, longitude: 77.2197 },
+      ],
+      route_path_source: 'straight-line sample route; illustrative only, not live road directions',
+      route_time_source: 'sample estimate; not live traffic',
+      travel_minutes_estimate: 95,
+      travel_distance_km_estimate: 14.5,
+    },
+    {
+      day: 2,
+      theme: 'Old Delhi & local culture',
+      note: 'Explore historic Old Delhi, allow time for the market lanes, then end near central Delhi.',
+      activities: [
+        createSampleActivity('red-fort', 'Red Fort', 'Explore the historic fort complex; check current visitor rules and opening details.', 'Heritage site', 28.6562, 77.2410, 90),
+        createSampleActivity('jama-masjid', 'Jama Masjid', "Visit one of Old Delhi's best-known mosques while following local visitor guidance.", 'Religious & historic site', 28.6507, 77.2334, 45),
+        createSampleActivity('chandni-chowk', 'Chandni Chowk', 'Walk through the historic market area and sample local food from vendors of your choice.', 'Market & local food', 28.6506, 77.2303, 90),
+        createSampleActivity('bangla-sahib', 'Gurudwara Bangla Sahib', 'Visit the prominent Sikh gurdwara and sarovar; follow the site’s visitor guidance.', 'Religious & cultural site', 28.6264, 77.2091, 60),
+        createSampleActivity('connaught-place', 'Connaught Place', 'Finish around the central heritage district with options for cafes, food and shopping.', 'City centre & food', 28.6315, 77.2167, 60),
+      ],
+      route_path: [
+        { latitude: 28.6562, longitude: 77.2410 },
+        { latitude: 28.6507, longitude: 77.2334 },
+        { latitude: 28.6506, longitude: 77.2303 },
+        { latitude: 28.6264, longitude: 77.2091 },
+        { latitude: 28.6315, longitude: 77.2167 },
+      ],
+      route_path_source: 'straight-line sample route; illustrative only, not live road directions',
+      route_time_source: 'sample estimate; not live traffic',
+      travel_minutes_estimate: 110,
+      travel_distance_km_estimate: 10.8,
+    },
+  ],
+}
+
 const fieldClass = 'w-full rounded-xl border border-[#2B4A60] bg-[#091B2A] px-4 py-3 text-[#ECF5FC] outline-none transition placeholder:text-[#7E98AA] focus:border-[#57DCC6] focus:ring-2 focus:ring-[#57DCC6]/15'
 const fieldLabelClass = 'block text-sm font-semibold text-[#D9E7F1]'
 const formatINR = (amount: number) => `₹${amount.toLocaleString('en-IN')}`
@@ -713,9 +811,9 @@ export default function Home() {
   const [trip, setTrip] = useState<Trip | null>(null)
   const [planError, setPlanError] = useState<string | null>(null)
   const [isGenerating, setIsGenerating] = useState(false)
-  const [savedTrips, setSavedTrips] = useState<Trip[]>([])
+  const [savedTrips, setSavedTrips] = useState<Trip[]>([SAMPLE_NEW_DELHI_TRIP])
   const [savedTripsError, setSavedTripsError] = useState<string | null>(null)
-  const [savedTripsExpanded, setSavedTripsExpanded] = useState(false)
+  const [savedTripsExpanded, setSavedTripsExpanded] = useState(true)
   const [openingTripId, setOpeningTripId] = useState<number | null>(null)
   const [otherPlaces, setOtherPlaces] = useState<ExplorePlace[]>([])
   const [otherPlacesLoaded, setOtherPlacesLoaded] = useState(false)
@@ -747,7 +845,8 @@ export default function Home() {
   const loadSavedTrips = async () => {
     try {
       const saved = await getSavedTrips()
-      setSavedTrips(saved)
+      // Always keep the local demo available, even when the backend has no saved trips.
+      setSavedTrips([SAMPLE_NEW_DELHI_TRIP, ...saved.filter((item) => item.id !== SAMPLE_TRIP_ID)])
       setSavedTripsError(null)
     } catch (error) {
       setSavedTripsError(error instanceof Error ? error.message : 'Saved trips could not be loaded.')
@@ -1244,7 +1343,8 @@ export default function Home() {
     setOpeningTripId(tripId)
     setPlanError(null)
     try {
-      const savedTrip = await getTrip(tripId)
+      // The sample is local and opens instantly without a backend request.
+      const savedTrip = tripId === SAMPLE_TRIP_ID ? SAMPLE_NEW_DELHI_TRIP : await getTrip(tripId)
       setTrip(savedTrip)
       setOtherPlaces([])
       setOtherPlacesLoaded(false)
@@ -1783,9 +1883,10 @@ export default function Home() {
               <div className="p-5 sm:p-7">
                 <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-start">
                   <div>
-                    <p className="inline-flex items-center gap-2 text-[11px] font-extrabold uppercase tracking-[0.16em] text-[#78E7D4]"><Sparkles size={14} /> Your journey at a glance · itinerary #{trip.id}</p>
+                    <p className="inline-flex items-center gap-2 text-[11px] font-extrabold uppercase tracking-[0.16em] text-[#78E7D4]"><Sparkles size={14} /> {trip.id === SAMPLE_TRIP_ID ? 'Sample itinerary · preloaded for quick review' : `Your journey at a glance · itinerary #${trip.id}`}</p>
                     <h2 className="mt-2 text-2xl font-extrabold tracking-tight text-white sm:text-3xl">{trip.destination} · {trip.duration} {trip.duration === 1 ? 'day' : 'days'}</h2>
                     <p className="mt-2 text-sm text-[#B4C7D6]">{trip.travelers} {trip.travelers === 1 ? 'traveler' : 'travelers'} <span className="mx-1 text-[#55778A]">·</span> {trip.transport} <span className="mx-1 text-[#55778A]">·</span> {formatBudgetCurrency(trip.budget_input_amount ?? trip.budget, trip.budget_currency ?? 'INR')} group budget{trip.budget_currency === 'USD' ? ` (≈ ${formatINR(trip.budget)})` : ''}</p>
+                    {trip.id === SAMPLE_TRIP_ID && <p className="mt-3 max-w-3xl rounded-xl border border-[#57DCC6]/20 bg-[#0D2A37] px-3 py-2 text-xs leading-5 text-[#AFC4D3]">Preloaded RoamWise demo data so reviewers can explore the result immediately. The dashed map paths are illustrative straight-line segments, not live road directions; fees and opening details are not verified. Generate a new trip for live recommendations.</p>}
                   </div>
                   <button type="button" onClick={() => void downloadResultPdf('itinerary')} disabled={pdfPreparing !== null} className="pdf-hide inline-flex shrink-0 items-center justify-center gap-2 self-start rounded-xl border border-[#57DCC6]/40 bg-[#123B45] px-4 py-2.5 text-sm font-bold text-[#8AECDD] transition hover:border-[#57DCC6]/70 hover:bg-[#174A55] disabled:cursor-wait disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#57DCC6]">
                     <Download size={16} aria-hidden="true" />
@@ -2063,13 +2164,16 @@ export default function Home() {
               {savedTripsError && <p role="status" className="mt-4 rounded-xl border border-amber-300/20 bg-amber-200/5 px-3 py-2 text-sm text-amber-100">{savedTripsError}</p>}
               {savedTrips.length > 0 ? (
                 <div className="mt-4 grid min-w-0 grid-cols-1 gap-3 lg:grid-cols-2">
-                  {savedTrips.map((savedTrip) => (
-                    <button key={savedTrip.id} type="button" disabled={openingTripId === savedTrip.id} onClick={() => void openSavedTrip(savedTrip.id)} className="min-w-0 w-full rounded-xl border border-[#2B4A60] bg-[#091E2C] p-4 text-left transition hover:border-[#57DCC6]/45 disabled:opacity-60">
-                      <span className="block break-words text-sm font-bold leading-5 text-white">{savedTrip.destination} · {savedTrip.duration} {savedTrip.duration === 1 ? 'day' : 'days'}</span>
-                      <span className="mt-1 block text-xs text-[#8EA9BB]">Plan #{savedTrip.id} · {savedTrip.travelers} {savedTrip.travelers === 1 ? 'traveler' : 'travelers'} · {savedTrip.transport}</span>
-                      <span className="mt-2 block text-xs font-semibold text-[#70E6D2]">{openingTripId === savedTrip.id ? 'Opening…' : 'Open saved plan'}</span>
-                    </button>
-                  ))}
+                  {savedTrips.map((savedTrip) => {
+                    const isSample = savedTrip.id === SAMPLE_TRIP_ID
+                    return (
+                      <button key={savedTrip.id} type="button" disabled={openingTripId === savedTrip.id} onClick={() => void openSavedTrip(savedTrip.id)} className={`min-w-0 w-full rounded-xl border p-4 text-left transition disabled:opacity-60 ${isSample ? 'border-[#57DCC6]/45 bg-[#0D2A37] hover:border-[#57DCC6]' : 'border-[#2B4A60] bg-[#091E2C] hover:border-[#57DCC6]/45'}`}>
+                        <span className="block break-words text-sm font-bold leading-5 text-white">{isSample ? `Sample · ${savedTrip.destination} · ${savedTrip.duration} days` : `${savedTrip.destination} · ${savedTrip.duration} ${savedTrip.duration === 1 ? 'day' : 'days'}`}</span>
+                        <span className="mt-1 block text-xs text-[#8EA9BB]">{isSample ? 'Preloaded demo · opens instantly · illustrative map path' : `Plan #${savedTrip.id} · ${savedTrip.travelers} ${savedTrip.travelers === 1 ? 'traveler' : 'travelers'} · ${savedTrip.transport}`}</span>
+                        <span className="mt-2 block text-xs font-semibold text-[#70E6D2]">{openingTripId === savedTrip.id ? 'Opening…' : isSample ? 'Open sample itinerary →' : 'Open saved plan'}</span>
+                      </button>
+                    )
+                  })}
                 </div>
               ) : !savedTripsError && <p className="mt-4 text-sm text-[#8EA9BB]">Generate a plan to save it here.</p>}
             </div>
