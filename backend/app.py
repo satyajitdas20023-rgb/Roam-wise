@@ -10,6 +10,7 @@ import math
 import logging
 import hashlib
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import os
 import re
@@ -561,7 +562,7 @@ For each place, return:
 - area: local neighbourhood/road/town name that helps resolve it geographically
 
 Only use locations that are genuinely in or reasonably near the named destination. Never invent exact addresses, coordinates or activity availability. Return JSON only: {{"places":[{{"name":"...","category":"...","reason":"...","area":"..."}}]}}."""
-    response = _call_gemma_json(prompt, schema, "popular-place fallback" if broaden_to_popular else "place recommendations", max_tokens=4200 if broaden_to_popular else 3500)
+    response = _call_gemma_json(prompt, schema, "popular-place fallback" if broaden_to_popular else "place recommendations", max_tokens=3000 if broaden_to_popular else 2400)
     raw_places = response.get("places", [])
     if not isinstance(raw_places, list):
         raise ApiProblem("Gemma did not return a valid place recommendation list. Please retry.", 502, "gemma_invalid_response")
@@ -700,6 +701,50 @@ def _resolve_gemma_recommendations(
     return unmapped, geocoding_failures
 
 
+def _resolve_gemma_recommendations_parallel(
+    recommendations: list[dict[str, str]], plan: dict[str, Any], resolved_destination: str,
+    latitude: float, longitude: float, api_key: str, max_workers: int = 4,
+) -> tuple[list[str], int, dict[str, dict[str, Any]]]:
+    """Resolve independent recommendation names concurrently, preserving model order.
+
+    Each worker gets its own Flask application context and result dictionary. Results
+    are merged in the original recommendation order so the route planner remains
+    deterministic and duplicate locations are discarded safely.
+    """
+    app = current_app._get_current_object()
+
+    def resolve_one(recommendation: dict[str, str]):
+        with app.app_context():
+            local_by_id: dict[str, dict[str, Any]] = {}
+            unmapped, failures = _resolve_gemma_recommendations(
+                [recommendation], plan, resolved_destination, latitude, longitude,
+                api_key, local_by_id,
+            )
+            return unmapped, failures, local_by_id
+
+    if len(recommendations) <= 1:
+        results = [resolve_one(item) for item in recommendations]
+    else:
+        # Four concurrent lookups speeds up the usual 10-place pass without
+        # flooding Geoapify with a large burst of requests.
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(recommendations))) as pool:
+            results = list(pool.map(resolve_one, recommendations))
+
+    unmapped: list[str] = []
+    failures = 0
+    merged: dict[str, dict[str, Any]] = {}
+    for missing, failed_count, local_places in results:
+        unmapped.extend(missing)
+        failures += failed_count
+        for place in local_places.values():
+            lat, lng = float(place["latitude"]), float(place["longitude"])
+            if any(_distance_km(lat, lng, float(existing["latitude"]), float(existing["longitude"])) < 0.08
+                   for existing in merged.values()):
+                continue
+            merged[str(place["id"])] = place
+    return unmapped, failures, merged
+
+
 def _discover_gemma_places(plan: dict[str, Any]) -> tuple[list[dict[str, Any]], str, dict[str, float]]:
     """Gemma recommends attractions; if too few can be mapped, ask it for broader popular local options."""
     api_key = _geoapify_key()
@@ -707,8 +752,13 @@ def _discover_gemma_places(plan: dict[str, Any]) -> tuple[list[dict[str, Any]], 
     recommendations = _generate_gemma_place_recommendations(plan, resolved_destination)
     current_app.logger.info("Gemma proposed %d named locations for %r; resolving their coordinates.", len(recommendations), resolved_destination)
     by_id: dict[str, dict[str, Any]] = {}
-    unmapped, geocoding_failures = _resolve_gemma_recommendations(
-        recommendations, plan, resolved_destination, latitude, longitude, api_key, by_id
+    geocode_started = time.perf_counter()
+    unmapped, geocoding_failures, by_id = _resolve_gemma_recommendations_parallel(
+        recommendations, plan, resolved_destination, latitude, longitude, api_key
+    )
+    current_app.logger.info(
+        "Initial recommendation geocoding finished in %.2fs (%d/%d mapped).",
+        time.perf_counter() - geocode_started, len(by_id), len(recommendations),
     )
 
     # For destinations where the first pass maps only a handful of names, run one
@@ -726,11 +776,22 @@ def _discover_gemma_places(plan: dict[str, Any]) -> tuple[list[dict[str, Any]], 
                 plan, resolved_destination, broaden_to_popular=True,
                 exclude_names=[item["name"] for item in recommendations] + [place["name"] for place in by_id.values()],
             )
-            fallback_unmapped, fallback_failures = _resolve_gemma_recommendations(
-                fallback_recommendations, plan, resolved_destination, latitude, longitude, api_key, by_id
+            fallback_started = time.perf_counter()
+            fallback_unmapped, fallback_failures, fallback_places = _resolve_gemma_recommendations_parallel(
+                fallback_recommendations, plan, resolved_destination, latitude, longitude, api_key
             )
+            for place in fallback_places.values():
+                lat, lng = float(place["latitude"]), float(place["longitude"])
+                if any(_distance_km(lat, lng, float(existing["latitude"]), float(existing["longitude"])) < 0.08
+                       for existing in by_id.values()):
+                    continue
+                by_id[str(place["id"])] = place
             unmapped.extend(fallback_unmapped)
             geocoding_failures += fallback_failures
+            current_app.logger.info(
+                "Fallback recommendation geocoding finished in %.2fs (%d additional mapped).",
+                time.perf_counter() - fallback_started, len(fallback_places),
+            )
         except ApiProblem as error:
             # If the first pass already returned verified places, do not discard the
             # usable trip just because the optional fallback model call failed.
@@ -951,7 +1012,7 @@ def _compute_route_matrix(places: list[dict[str, Any]], transport: str) -> tuple
     if base and size >= 2:
         coords = ";".join(f"{float(p['longitude'])},{float(p['latitude'])}" for p in places)
         try:
-            response = _osrm_get(f"{base}/table/v1/driving/{coords}", params={"annotations": "duration,distance"}, timeout=(5, 25))
+            response = _osrm_get(f"{base}/table/v1/driving/{coords}", params={"annotations": "duration,distance"}, timeout=(2, 8))
             if response.ok:
                 payload = response.json()
                 durations = payload.get("durations") if isinstance(payload, dict) else None
@@ -1286,7 +1347,7 @@ def _attach_open_route_paths(
                 response = _osrm_get(
                     f"{route_base}/route/v1/driving/{coordinates}",
                     params={"overview": "full", "geometries": "geojson", "steps": "false"},
-                    timeout=(5, 20),
+                    timeout=(2, 7),
                 )
                 if not response.ok:
                     current_app.logger.warning("OSRM route geometry provider returned HTTP %s for day %s.", response.status_code, day.get("day"))
@@ -1798,16 +1859,27 @@ def create_app(config_overrides: dict[str, Any] | None = None) -> Flask:
         _require_env("GEMMA_API_KEY", "recommend real visitor places and optimize the itinerary")
         _require_env("GEOAPIFY_API_KEY", "resolve the destination and suggested places to coordinates")
 
+        # Record stage timings so production logs identify the real latency source.
+        plan_started = time.perf_counter()
         # Gemma chooses attractions/activity areas. Geoapify only resolves those names to map coordinates.
+        discovery_started = time.perf_counter()
         all_places, resolved_destination, center = _discover_gemma_places(plan_request)
+        current_app.logger.info("Plan stage discovery (Gemma + Geoapify): %.2fs; %d verified places.",
+                                time.perf_counter() - discovery_started, len(all_places))
         # The broader Gemma fallback has already tried to supplement sparse results.
         # Keep any remaining verified stops instead of failing solely on a low count.
 
         candidates = _rank_places(all_places, plan_request["interests"])[:MAX_CANDIDATES_FOR_ROUTING]
+        matrix_started = time.perf_counter()
         route_matrix, route_source = _compute_route_matrix(candidates, plan_request["transport"])
+        current_app.logger.info("Plan stage route matrix: %.2fs.", time.perf_counter() - matrix_started)
+        itinerary_started = time.perf_counter()
         itinerary = _generate_gemma_itinerary(plan_request, candidates, resolved_destination, route_matrix, route_source)
+        current_app.logger.info("Plan stage local itinerary optimization: %.2fs.", time.perf_counter() - itinerary_started)
         by_id = {str(place["id"]): place for place in candidates}
+        paths_started = time.perf_counter()
         _attach_open_route_paths(itinerary, plan_request, by_id, center)
+        current_app.logger.info("Plan stage route geometry: %.2fs.", time.perf_counter() - paths_started)
         # Do not fabricate transport, lodging, food, or miscellaneous cost estimates.
         # Keep the submitted budget as planner context, but persist an empty legacy
         # breakdown object for compatibility with existing SQLite databases.
@@ -1817,8 +1889,11 @@ def create_app(config_overrides: dict[str, Any] | None = None) -> Flask:
             "budget_breakdown": {},
             "planner_engine": f"Gemma ({os.getenv('GEMMA_MODEL', 'gemma-4-31b-it')}) recommendations + Geoapify geocoding + OpenStreetMap OSRM + open route optimization ({route_source})",
         }
+        save_started = time.perf_counter()
         trip = _save_trip(plan)
+        current_app.logger.info("Plan stage SQLite save: %.2fs.", time.perf_counter() - save_started)
         trip["itinerary"] = itinerary
+        current_app.logger.info("Plan request completed in %.2fs.", time.perf_counter() - plan_started)
         return jsonify({"trip": trip}), 201
 
 

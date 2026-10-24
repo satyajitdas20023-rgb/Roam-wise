@@ -1659,8 +1659,8 @@ export default function Home() {
                       <div className="min-w-0">
                         <p className="inline-flex items-center gap-2 text-[10px] font-extrabold uppercase tracking-[0.16em] text-[#78E7D4]"><Trees size={14} /> Optional add-on · 100 km radius</p>
                         <h3 id="other-places-title" className="mt-1 text-xl font-extrabold text-white sm:text-2xl">Other places to explore</h3>
-                        <p className="mt-2 max-w-2xl text-sm leading-6 text-[#AFC4D3]">Discover more nearby sights, wildlife sanctuaries, nature reserves, viewpoints, heritage spots and activities based on your interests. Select the places you want, then generate a separate optimized route.</p>
-                        <p className="mt-2 text-xs leading-5 text-[#7F9DAF]">Your original itinerary stays exactly as it is. Extra stops are saved in a separate section, not added to your main trip.</p>
+                        
+                        
                       </div>
                       <button type="button" onClick={() => void discoverOtherPlaces()} disabled={otherPlacesLoading} className="inline-flex shrink-0 items-center justify-center gap-2 rounded-xl border border-[#57DCC6]/35 bg-[#123B45] px-4 py-2.5 text-sm font-bold text-[#8AECDD] transition hover:border-[#57DCC6]/70 hover:bg-[#174A55] disabled:cursor-wait disabled:opacity-65">
                         {otherPlacesLoading ? <LoaderCircle size={16} className="animate-spin" aria-hidden="true" /> : <Search size={16} aria-hidden="true" />}
