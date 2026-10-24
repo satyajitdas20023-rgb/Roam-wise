@@ -399,6 +399,7 @@ function ItineraryMap({ destination, itinerary }: { destination: string; itinera
         mapInstanceRef.current = map
         L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
           maxZoom: 19,
+          crossOrigin: true,
           attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap</a> contributors',
         }).addTo(map)
 
@@ -1075,9 +1076,13 @@ export default function Home() {
       ? `${trip!.destination} - ${trip!.duration}-day itinerary`
       : `${activeExplorationRoute!.destination} - extra places route`
     let restored = false
+    let mapSnapshot: HTMLImageElement | null = null
+    let mapSnapshotTarget: HTMLElement | null = null
     const restorePrintState = () => {
       if (restored) return
       restored = true
+      mapSnapshot?.remove()
+      mapSnapshotTarget?.removeAttribute('data-pdf-map-live-hidden')
       document.title = originalTitle
       if (originalTarget === null) document.body.removeAttribute('data-roamwise-pdf-target')
       else document.body.setAttribute('data-roamwise-pdf-target', originalTarget)
@@ -1107,6 +1112,61 @@ export default function Home() {
           }))),
           new Promise<void>((resolve) => window.setTimeout(resolve, 5000)),
         ])
+      }
+      // Capture the already-rendered Leaflet map as a bitmap before printing.
+      // Chromium's print renderer often omits cross-origin OSM tiles even when
+      // the live map looks correct. The snapshot keeps tiles, route lines and
+      // markers together as one image in the saved PDF.
+      const mapElement = section.querySelector<HTMLElement>('.leaflet-container')
+      if (mapElement && mapElement.offsetWidth > 0 && mapElement.offsetHeight > 0) {
+        const loadHtml2Canvas = async (): Promise<((element: HTMLElement, options?: Record<string, unknown>) => Promise<HTMLCanvasElement>)> => {
+          const win = window as Window & { html2canvas?: (element: HTMLElement, options?: Record<string, unknown>) => Promise<HTMLCanvasElement> }
+          if (win.html2canvas) return win.html2canvas
+          await new Promise<void>((resolve, reject) => {
+            const existing = document.querySelector<HTMLScriptElement>('script[data-roamwise-html2canvas]')
+            if (existing) {
+              existing.addEventListener('load', () => resolve(), { once: true })
+              existing.addEventListener('error', () => reject(new Error('Could not load map screenshot helper')), { once: true })
+              return
+            }
+            const script = document.createElement('script')
+            script.src = 'https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js'
+            script.async = true
+            script.dataset.roamwiseHtml2canvas = 'true'
+            script.onload = () => resolve()
+            script.onerror = () => reject(new Error('Could not load map screenshot helper'))
+            document.head.appendChild(script)
+          })
+          const fn = (window as Window & { html2canvas?: (element: HTMLElement, options?: Record<string, unknown>) => Promise<HTMLCanvasElement> }).html2canvas
+          if (!fn) throw new Error('Map screenshot helper did not initialize')
+          return fn
+        }
+        try {
+          const html2canvas = await loadHtml2Canvas()
+          const canvas = await html2canvas(mapElement, {
+            backgroundColor: '#ffffff',
+            scale: Math.min(2, window.devicePixelRatio || 1.5),
+            useCORS: true,
+            allowTaint: false,
+            logging: false,
+            imageTimeout: 8000,
+          })
+          mapSnapshot = document.createElement('img')
+          mapSnapshot.src = canvas.toDataURL('image/png')
+          mapSnapshot.alt = 'Map and road routes for this itinerary'
+          mapSnapshot.className = 'pdf-map-snapshot'
+          mapSnapshot.style.width = '100%'
+          mapSnapshot.style.height = '360px'
+          mapSnapshot.style.objectFit = 'contain'
+          mapSnapshot.style.background = '#ffffff'
+          mapSnapshot.style.display = 'none'
+          mapElement.parentElement?.insertBefore(mapSnapshot, mapElement.nextSibling)
+          mapSnapshotTarget = mapElement
+          mapElement.setAttribute('data-pdf-map-live-hidden', 'true')
+        } catch (snapshotError) {
+          // Keep the regular print path as a fallback if screenshot capture fails.
+          console.warn('RoamWise could not snapshot the map for PDF; using browser print rendering.', snapshotError)
+        }
       }
       await new Promise<void>((resolve) => window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve())))
       window.print()
@@ -1325,6 +1385,10 @@ export default function Home() {
         }
         #generated-itinerary .leaflet-control-zoom,
         #active-exploration-route .leaflet-control-zoom { display: none !important; }
+        #generated-itinerary .pdf-map-snapshot,
+        #active-exploration-route .pdf-map-snapshot { display: block !important; width: 100% !important; height: 360px !important; object-fit: contain !important; break-inside: avoid !important; page-break-inside: avoid !important; }
+        #generated-itinerary [data-pdf-map-live-hidden="true"],
+        #active-exploration-route [data-pdf-map-live-hidden="true"] { display: none !important; }
         #generated-itinerary a, #active-exploration-route a { text-decoration: none !important; }
       }
     `}</style>
