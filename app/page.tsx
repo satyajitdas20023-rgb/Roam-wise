@@ -677,9 +677,6 @@ export default function Home() {
   const [interests, setInterests] = useState<string[]>(['History', 'Local food'])
   const [apiDestinations, setApiDestinations] = useState<ApiDestination[]>([])
   const [exploreDestinations, setExploreDestinations] = useState<ApiDestination[]>([])
-  // Keep built-in cards visible until live data is ready, and tie empty state to a successful query.
-  const [hasLoadedExploreDestinations, setHasLoadedExploreDestinations] = useState(false)
-  const [successfulExploreQuery, setSuccessfulExploreQuery] = useState<string | null>(null)
   const [exploreError, setExploreError] = useState<string | null>(null)
   const [isSearching, setIsSearching] = useState(false)
   const [trip, setTrip] = useState<Trip | null>(null)
@@ -742,7 +739,6 @@ export default function Home() {
         if (!active) return
         setApiDestinations(items)
         setExploreDestinations(items)
-        setHasLoadedExploreDestinations(true)
       })
       .catch(() => {
         // The Explore screen identifies its intentional local visual fallback.
@@ -751,23 +747,16 @@ export default function Home() {
   }, [])
 
   useEffect(() => {
-    if (view !== 'explore') {
-      setIsSearching(false)
-      return
-    }
+    if (view !== 'explore') return
     const controller = new AbortController()
-    // Start loading immediately, while keeping the request itself debounced.
-    setIsSearching(true)
-    setSuccessfulExploreQuery(null)
     const timer = window.setTimeout(async () => {
+      setIsSearching(true)
       try {
         // The client owns the request lifetime; API errors retain a readable fallback.
         const items = await searchDestinations(search, controller.signal)
         if (!controller.signal.aborted) {
           setExploreDestinations(items)
           setExploreError(null)
-          setHasLoadedExploreDestinations(true)
-          setSuccessfulExploreQuery(search.trim())
         }
       } catch (error) {
         if (!controller.signal.aborted) {
@@ -959,8 +948,8 @@ export default function Home() {
   }, [search])
 
   const filteredDestinations = useMemo(
-    () => (exploreError || isSearching || !hasLoadedExploreDestinations ? fallbackSearchResults : exploreDestinations.map(toDestinationCard)),
-    [exploreDestinations, exploreError, fallbackSearchResults, hasLoadedExploreDestinations, isSearching],
+    () => (exploreError ? fallbackSearchResults : exploreDestinations.map(toDestinationCard)),
+    [exploreDestinations, exploreError, fallbackSearchResults],
   )
 
 
@@ -1356,14 +1345,14 @@ export default function Home() {
                 </article>
               ))}
             </div>
-          ) : !isSearching && hasLoadedExploreDestinations && successfulExploreQuery === search.trim() && !exploreError ? (
+          ) : (
             <div className="mt-12 rounded-2xl border border-dashed border-[#35566A] bg-[#0C2232]/60 p-10 text-center text-sm text-[#A8BECE]">
               <p>No curated Explore cards match “{search}”. You can still plan any destination with Gemma's recommendations.</p>
               <button type="button" onClick={() => openPlanner(search.trim())} className="mt-4 inline-flex items-center gap-2 rounded-full border border-[#57DCC6]/30 bg-[#123B45] px-4 py-2.5 text-sm font-semibold text-[#83EAD9] transition hover:bg-[#174A55]">
                 Plan {search.trim() ? `a trip to ${search.trim()}` : 'a trip'} <ArrowRight size={15} />
               </button>
             </div>
-          ) : null}
+          )}
         </section>
       )}
 
