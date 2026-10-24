@@ -1765,7 +1765,7 @@ export default function Home() {
             <div className="mt-6 flex flex-col items-stretch gap-3 sm:mt-7 sm:flex-row sm:flex-wrap sm:items-center">
               <button disabled={isGenerating} type="submit" className="inline-flex w-full shrink-0 items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-[#38D3B9] via-[#3BC7C4] to-[#5EBDEB] px-6 py-3.5 font-extrabold text-[#041923] shadow-[0_12px_30px_rgba(37,188,165,0.20)] transition hover:-translate-y-0.5 hover:brightness-110 disabled:translate-y-0 disabled:cursor-wait disabled:opacity-80 sm:w-auto sm:min-w-[230px]">
                 {isGenerating ? <LoaderCircle size={17} className="animate-spin" aria-hidden="true" /> : <Sparkles size={17} aria-hidden="true" />}
-                {isGenerating ? 'Generating itinerary…' : 'Generate itinerary'}
+                {isGenerating ? 'Generating, this will take a few minutes' : 'Generate itinerary'}
                 {!isGenerating && <ArrowRight size={17} aria-hidden="true" />}
               </button>
               {isGenerating && (
