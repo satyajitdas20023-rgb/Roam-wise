@@ -531,7 +531,13 @@ def _generate_gemma_place_recommendations(
     exclude_names: list[str] | None = None,
 ) -> list[dict[str, str]]:
     """Gemma is the recommender. In fallback mode, broaden to popular local sights matching interests."""
-    count = 12 if broaden_to_popular else min(20, max(10, plan["duration"] * 4 + len(plan["interests"])))
+    # The route optimizer can consume at most MAX_CANDIDATES_FOR_ROUTING places.
+    # Keep the model response within that useful ceiling so structured output does
+    # not fail simply because an unnecessarily large list was requested.
+    count = 12 if broaden_to_popular else min(
+        MAX_CANDIDATES_FOR_ROUTING,
+        max(10, plan["duration"] * 4 + len(plan["interests"])),
+    )
     schema = {
         "type": "OBJECT", "required": ["places"],
         "properties": {"places": {"type": "ARRAY", "items": {"type": "OBJECT",
@@ -561,8 +567,13 @@ For each place, return:
 - reason: short explanation of why it fits the selected interests
 - area: local neighbourhood/road/town name that helps resolve it geographically
 
-Only use locations that are genuinely in or reasonably near the named destination. Never invent exact addresses, coordinates or activity availability. Return JSON only: {{"places":[{{"name":"...","category":"...","reason":"...","area":"..."}}]}}."""
-    response = _call_gemma_json(prompt, schema, "popular-place fallback" if broaden_to_popular else "place recommendations", max_tokens=1800 if broaden_to_popular else 2400)
+Only use locations that are genuinely in or reasonably near the named destination. Never invent exact addresses, coordinates or activity availability. Return one structured result using the supplied response function; do not add prose or markdown. Keep each reason to one concise sentence (about 15 words maximum), and keep category and area short."""
+    response = _call_gemma_json(
+        prompt,
+        schema,
+        "popular-place fallback" if broaden_to_popular else "place recommendations",
+        max_tokens=3072,
+    )
     raw_places = response.get("places", [])
     if not isinstance(raw_places, list):
         raise ApiProblem("Gemma did not return a valid place recommendation list. Please retry.", 502, "gemma_invalid_response")
@@ -828,12 +839,13 @@ INTEREST_TERMS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _call_gemma_json(prompt: str, response_schema: dict[str, Any], purpose: str, max_tokens: int = 2400) -> dict[str, Any]:
-    """Call hosted Gemma with structured output and a second-model fallback.
+def _call_gemma_json(prompt: str, response_schema: dict[str, Any], purpose: str, max_tokens: int = 3072) -> dict[str, Any]:
+    """Ask hosted Gemma to return structured data via a forced function call.
 
-    Do not fall back to plain-text mode: this project's tested Gemma endpoint can
-    fail on plain generation while succeeding with response_schema. For HTTP 5xx
-    failures, retry briefly then try the other Gemma 4 model with the same schema.
+    Gemma supports function calling. Taking its arguments from the function-call
+    part avoids depending on the model to serialize a long JSON string correctly.
+    The previous JSON-text parser remains as a compatibility fallback for SDK/API
+    responses that contain text instead of function-call arguments.
     """
     api_key = _require_env("GEMMA_API_KEY", "generate a travel plan")
     primary = os.getenv("GEMMA_MODEL", "gemma-4-31b-it").strip() or "gemma-4-31b-it"
@@ -845,11 +857,31 @@ def _call_gemma_json(prompt: str, response_schema: dict[str, Any], purpose: str,
             model_names.append(name)
 
     client = genai.Client(api_key=api_key)
+    function_name = "return_structured_result"
     system_instruction = (
-        "You are a precise RoamWise travel-planning component. Follow the requested JSON schema. "
-        "Never invent real-world place records. Return one JSON object matching the schema."
+        "You are a precise RoamWise travel-planning component. "
+        "You MUST call the return_structured_result function and put the complete "
+        "requested result in its arguments. Follow the declared function parameter "
+        "schema exactly. Do not answer with free-form text, markdown, or invented data."
     )
+    function_declaration = types.FunctionDeclaration(
+        name=function_name,
+        description=f"Return the complete structured result for {purpose}, matching the declared parameters.",
+        parameters=response_schema,
+    )
+    tools = [types.Tool(function_declarations=[function_declaration])]
+    tool_config = types.ToolConfig(
+        function_calling_config=types.FunctionCallingConfig(
+            mode="ANY",
+            allowed_function_names=[function_name],
+        )
+    )
+    automatic_function_calling = types.AutomaticFunctionCallingConfig(disable=True)
+
     last_error: Exception | None = None
+    last_output_chars = 0
+    last_finish_reason = "unknown"
+    last_function_call_count = 0
 
     for model_index, model_name in enumerate(model_names):
         request_prompt = prompt
@@ -865,12 +897,54 @@ def _call_gemma_json(prompt: str, response_schema: dict[str, Any], purpose: str,
                         system_instruction=system_instruction,
                         temperature=0.1 if purpose == "search-query generation" else 0.0,
                         max_output_tokens=max_tokens,
-                        response_mime_type="application/json",
-                        response_schema=response_schema,
+                        tools=tools,
+                        tool_config=tool_config,
+                        automatic_function_calling=automatic_function_calling,
                         thinking_config=types.ThinkingConfig(thinking_level="minimal"),
                     ),
                 )
+
+                # This is the normal path: function-call arguments arrive as a dict,
+                # not as a JSON string the model must correctly escape and close.
+                try:
+                    function_calls = getattr(response, "function_calls", None) or []
+                except Exception:
+                    function_calls = []
+                last_function_call_count = len(function_calls)
+                for function_call in function_calls:
+                    call_name = getattr(function_call, "name", None)
+                    arguments = getattr(function_call, "args", None)
+                    if call_name == function_name and isinstance(arguments, dict):
+                        if model_name != primary:
+                            current_app.logger.warning(
+                                "Gemma %s succeeded using fallback model=%s (primary=%s).",
+                                purpose, model_name, primary,
+                            )
+                        return arguments
+
+                # Some SDK versions expose the structured result via .parsed. Use it
+                # if the function-call convenience property is unavailable.
+                try:
+                    parsed_value = getattr(response, "parsed", None)
+                except Exception:
+                    parsed_value = None
+                if isinstance(parsed_value, dict):
+                    if model_name != primary:
+                        current_app.logger.warning(
+                            "Gemma %s succeeded using fallback model=%s (primary=%s).",
+                            purpose, model_name, primary,
+                        )
+                    return parsed_value
+
                 output = _gemma_response_text(response)
+                last_output_chars = len(output)
+                try:
+                    candidates = getattr(response, "candidates", None) or []
+                    finish_reason = getattr(candidates[0], "finish_reason", None) if candidates else None
+                    last_finish_reason = getattr(finish_reason, "name", None) or str(finish_reason or "unknown")
+                except Exception:
+                    last_finish_reason = "unknown"
+
                 try:
                     parsed = _parse_model_json(output)
                     if model_name != primary:
@@ -883,12 +957,15 @@ def _call_gemma_json(prompt: str, response_schema: dict[str, Any], purpose: str,
                     if not format_retry_used:
                         format_retry_used = True
                         request_prompt = prompt + (
-                            "\n\nRETRY: Return a complete JSON object that exactly follows the supplied response schema. "
-                            "No markdown or prose. Keep the response concise and do not add extra fields."
+                            "\n\nRETRY: Call return_structured_result exactly once with a compact, complete result. "
+                            "For place recommendations, return at most 8 distinct places on this retry. "
+                            "Keep each reason under 15 words and category/area short. "
+                            "Do not output a JSON string, markdown, or explanations outside the function call."
                         )
                         current_app.logger.warning(
-                            "Gemma %s JSON could not be parsed (model=%s); retrying once with structured output enabled.",
-                            purpose, model_name,
+                            "Gemma %s returned no usable structured function arguments (model=%s, calls=%d, "
+                            "text_chars=%d, finish_reason=%s); retrying once with a compact response.",
+                            purpose, model_name, last_function_call_count, last_output_chars, last_finish_reason,
                         )
                         continue
                     break
@@ -925,14 +1002,18 @@ def _call_gemma_json(prompt: str, response_schema: dict[str, Any], purpose: str,
 
         if model_index < len(model_names) - 1:
             current_app.logger.warning(
-                "Gemma %s failed with model=%s; trying fallback model=%s with structured output.",
+                "Gemma %s failed with model=%s; trying fallback model=%s with structured function calling.",
                 purpose, model_name, model_names[model_index + 1],
             )
 
     if isinstance(last_error, (ValueError, json.JSONDecodeError)):
-        current_app.logger.error("Gemma %s returned invalid structured JSON across available models.", purpose)
+        current_app.logger.error(
+            "Gemma %s produced no usable structured response across models=%s "
+            "(last_function_calls=%d, text_chars=%d, finish_reason=%s).",
+            purpose, ",".join(model_names), last_function_call_count, last_output_chars, last_finish_reason,
+        )
         raise ApiProblem(
-            f"Gemma returned invalid structured JSON for {purpose}. Please retry.",
+            f"Gemma could not return a usable structured response for {purpose}. Please retry.",
             502, "gemma_invalid_response",
         ) from last_error
 
