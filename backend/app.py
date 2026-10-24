@@ -1735,7 +1735,18 @@ def create_app(config_overrides: dict[str, Any] | None = None) -> Flask:
     if config_overrides:
         app.config.update(config_overrides)
 
-    CORS(app, resources={r"/api/*": {"origins": app.config["CORS_ORIGINS"]}}, methods=["GET", "POST", "DELETE", "OPTIONS"], allow_headers=["Content-Type", "Accept"])
+    # Allow the configured origins plus any HTTPS Render-hosted frontend origin.
+    # This prevents browser fetches from being rejected if the frontend service is renamed
+    # and Render gives it a different *.onrender.com hostname. The API remains public;
+    # CORS is a browser policy, not an authentication boundary.
+    render_frontend_origin = re.compile(r"^https://[a-z0-9-]+\.onrender\.com$", re.IGNORECASE)
+    allowed_origins = [*app.config["CORS_ORIGINS"], render_frontend_origin]
+    CORS(
+        app,
+        resources={r"/api/*": {"origins": allowed_origins}},
+        methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_headers=["Content-Type", "Accept"],
+    )
     _init_database(app)
 
     @app.errorhandler(ApiProblem)

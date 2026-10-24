@@ -5,7 +5,9 @@ services:
     rootDir: backend
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --bind 0.0.0.0:$PORT 'app:create_app()'
+    # Itinerary generation calls external services and can exceed Gunicorn's 30 s default.
+    # Threads let health checks and short requests proceed while one itinerary is generated.
+    startCommand: gunicorn --timeout 90 --workers 1 --threads 4 --access-logfile - --error-logfile - --bind 0.0.0.0:$PORT 'app:create_app()'
     healthCheckPath: /api/health
     envVars:
       - key: GEMMA_API_KEY
