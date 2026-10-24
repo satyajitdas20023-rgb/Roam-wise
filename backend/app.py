@@ -1071,7 +1071,7 @@ def _optimize_activity_order(activities: list[dict[str, Any]], matrix: dict[str,
                 best_cost, best_order = total, order
         return [activities[i] for i in best_order]
     try:
-        from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+        from ortools.constraint_solver import pywrapcp, routing_enums_pb2  # type: ignore[import-not-found]  # Optional; a heuristic fallback is provided below.
         dummy = n
         manager = pywrapcp.RoutingIndexManager(n + 1, 1, [dummy], [dummy])
         routing = pywrapcp.RoutingModel(manager)

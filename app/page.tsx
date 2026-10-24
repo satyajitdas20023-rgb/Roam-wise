@@ -462,7 +462,7 @@ function ItineraryMap({ destination, itinerary }: { destination: string; itinera
               lineCap: 'round', lineJoin: 'round',
             }).addTo(map)
             routesLoaded += 1
-            if (approximate) routeFailures += 1
+            if (approximate) failures += 1
             continue
           }
 
@@ -1650,7 +1650,7 @@ export default function Home() {
                     </div>
                   </div>
                   <ItineraryMap destination={trip.destination} itinerary={trip.itinerary} />
-                  <p className="border-t border-[#29485C] px-4 py-3 text-[11px] leading-5 text-[#7898AC] sm:px-5">Map tiles © OpenStreetMap contributors. Road routes are fetched from the public OSRM demo service when available; they are driving-route previews, not live traffic or guaranteed navigation.</p>
+                  
                 </div>
 
                 <section className="mt-7 overflow-hidden rounded-2xl border border-[#2B5967] bg-gradient-to-br from-[#0D2938] to-[#081B28]" aria-labelledby="other-places-title">
